@@ -3,8 +3,8 @@ import pandas as pd
 from datetime import datetime
 from io import BytesIO
 
-st.set_page_config(page_title="QA Assignment", layout="wide")
-st.title("📊 QA Assignment — Stage 4 (Optimized)")
+st.set_page_config(page_title="QA Assignment - Stage 4", layout="wide")
+st.title("📊 QA Assignment — Stage 4 (Optimized & Safe Columns)")
 
 # --- File upload ---
 uploaded_file = st.file_uploader("Upload QA Excel file", type=["xlsx"])
@@ -38,6 +38,17 @@ if custom_input:
 # --- Load Excel into DataFrames ---
 qa_df = pd.read_excel(uploaded_file, sheet_name="QA")
 mp_df = pd.read_excel(uploaded_file, sheet_name="MP")
+
+# --- Normalize QA column names ---
+qa_df.columns = [str(c).strip().upper() for c in qa_df.columns]
+st.write("📝 QA Sheet Columns:", qa_df.columns.tolist())
+
+# --- Check for essential columns ---
+required_cols = ['DIVISION','BRAND','WORKFLOW','AG','AH','AQ']
+for col in required_cols:
+    if col not in qa_df.columns:
+        st.error(f"❌ Column '{col}' not found in QA sheet. Please check your Excel file.")
+        st.stop()
 
 # --- Build preferences ---
 preferences = {}
@@ -76,6 +87,7 @@ priority_mask = qa_df['AG'].apply(lambda x: pd.notna(x) and isinstance(x, (int, 
 priority_rows = qa_df[priority_mask].index.tolist()
 
 # --- Stage 4: Backlog sorting ---
+qa_df['AQ'] = pd.to_datetime(qa_df['AQ'], errors='coerce')
 if backlog_mode:
     st.info("🕐 Backlog mode ON — sorting by AQ date.")
     qa_df.sort_values(by='AQ', inplace=True)
@@ -95,7 +107,7 @@ for idx in priority_rows:
 # --- Assign preferred divisions ---
 for member, prefs in active_preferences.items():
     for div in prefs:
-        mask = qa_df['AssignedTo'].isna() & (qa_df['Division'] == div)
+        mask = qa_df['AssignedTo'].isna() & (qa_df['DIVISION'] == div)
         unassigned_idx = qa_df[mask].index.tolist()
         for idx in unassigned_idx:
             if counts[member] >= member_limit(member):
@@ -103,7 +115,7 @@ for member, prefs in active_preferences.items():
             assign_row(idx, member)
 
 # --- Assign remaining by brand (brand blocks together) ---
-for brand, group in qa_df[qa_df['AssignedTo'].isna()].groupby('Brand'):
+for brand, group in qa_df[qa_df['AssignedTo'].isna()].groupby('BRAND'):
     unassigned_idx = group.index.tolist()
     while unassigned_idx:
         eligible = eligible_members()
@@ -119,7 +131,7 @@ for brand, group in qa_df[qa_df['AssignedTo'].isna()].groupby('Brand'):
 
 # --- Assignment preview ---
 st.subheader("👀 Preview of Assignments")
-st.dataframe(qa_df[['Division','Brand','Workflow','AssignedTo']].head(50))  # show first 50 rows
+st.dataframe(qa_df[['DIVISION','BRAND','WORKFLOW','AssignedTo']].head(50))
 st.info("Scroll horizontally and vertically to preview more rows.")
 
 # --- Prepare Excel file for download ---
