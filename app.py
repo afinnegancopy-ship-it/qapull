@@ -80,17 +80,11 @@ assignments = {m: [] for m in team_members}
 def member_limit(member):
     return custom_limits.get(member, DEFAULT_TARGET)
 
-def assign_block(member, rows_idx):
-    remaining_capacity = member_limit(member) - counts[member]
-    assign_count = min(len(rows_idx), remaining_capacity)
-    if assign_count <= 0:
-        return
-    qa_df.loc[rows_idx[:assign_count], 'Assigned'] = member
-    assignments[member].extend(rows_idx[:assign_count])
-    counts[member] += assign_count
+# --- Filter only populated rows ---
+populated_df = qa_df[qa_df['Brand'].notna() & qa_df['Division'].notna()]
 
-# Step 1: Priority overrides
-priority_override_rows = qa_df[qa_df['PriorityOverride'].notna()]
+# --- Step 1: Priority overrides ---
+priority_override_rows = populated_df[populated_df['PriorityOverride'].notna()]
 for idx, row in priority_override_rows.iterrows():
     eligible = [m for m in team_members if counts[m] < member_limit(m)]
     if eligible:
@@ -101,19 +95,33 @@ for idx, row in priority_override_rows.iterrows():
     else:
         qa_df.at[idx, 'Assigned'] = "Backlog"
 
-# Step 2: Preferred divisions with brand + workflow
+# --- Step 2: Preferred divisions with brand + workflow ---
 for member in team_members:
     prefs = active_preferences[member]
     for pref_div in prefs:
-        unassigned_df = qa_df[(qa_df['Assigned'].isna()) & (qa_df['Division'] == pref_div)]
+        # Only consider unassigned and populated rows
+        unassigned_df = qa_df[(qa_df['Assigned'].isna()) & 
+                              (qa_df['Division'] == pref_div) & 
+                              qa_df['Brand'].notna()]
         for brand, brand_group in unassigned_df.groupby('Brand'):
-            priority_rows = brand_group[brand_group['Workflow'] == "Prioritise in Workflow"].index.tolist()
-            normal_rows = brand_group[brand_group['Workflow'] != "Prioritise in Workflow"].index.tolist()
-            assign_block(member, priority_rows)
-            assign_block(member, normal_rows)
+            rows_idx = brand_group.index.tolist()
+            remaining_capacity = member_limit(member) - counts[member]
 
-# Step 3: Remaining unassigned
-unassigned_idx = qa_df[qa_df['Assigned'].isna()].index
+            # Assign as much as possible of this brand to this member
+            while rows_idx and remaining_capacity > 0:
+                assign_count = min(len(rows_idx), remaining_capacity)
+                assign_rows = rows_idx[:assign_count]
+                
+                qa_df.loc[assign_rows, 'Assigned'] = member
+                assignments[member].extend(assign_rows)
+                counts[member] += assign_count
+
+                # Remove assigned rows from the brand group
+                rows_idx = rows_idx[assign_count:]
+                remaining_capacity = member_limit(member) - counts[member]
+
+# --- Step 3: Remaining unassigned rows ---
+unassigned_idx = qa_df[qa_df['Assigned'].isna() & qa_df['Brand'].notna()].index
 for idx in unassigned_idx:
     eligible = [m for m in team_members if counts[m] < member_limit(m)]
     if eligible:
@@ -124,7 +132,7 @@ for idx in unassigned_idx:
     else:
         qa_df.at[idx, 'Assigned'] = "Backlog"
 
-# --- Write assignments back to original QA sheet only ---
+# --- Write assignments back to original QA sheet ---
 if 'Assigned' not in [cell.value for cell in qa_ws[1]]:
     qa_ws.insert_cols(1)  # Insert column A if not present
     qa_ws.cell(row=1, column=1, value='Assigned')
