@@ -1,12 +1,11 @@
 import streamlit as st
-import openpyxl
-from openpyxl import load_workbook
+import pandas as pd
+from io import BytesIO
 from datetime import datetime
 from collections import defaultdict
-from io import BytesIO
 
 st.set_page_config(page_title="QA Assignment", layout="wide")
-st.title("📊 QA Assignment — Stage 4")
+st.title("📊 QA Assignment")
 
 # --- File upload ---
 uploaded_file = st.file_uploader("Upload QA Excel file", type=["xlsx"])
@@ -14,10 +13,9 @@ if uploaded_file is None:
     st.info("Please upload an Excel file to proceed.")
     st.stop()
 
-# --- Load workbook ---
-wb = load_workbook(uploaded_file)
-qa_ws = wb["QA"]
-mp_ws = wb["MP"]
+# --- Load sheets with pandas ---
+qa_df = pd.read_excel(uploaded_file, sheet_name="QA")
+mp_df = pd.read_excel(uploaded_file, sheet_name="MP")
 
 # --- Streamlit inputs ---
 backlog_mode = st.radio("Are you expecting to be in backlog today?", ["No", "Yes"]) == "Yes"
@@ -44,10 +42,11 @@ if custom_input:
 
 # --- Read preferences from MP sheet ---
 preferences = {}
-for row in mp_ws.iter_rows(min_row=2, values_only=True):
-    name, divs = row[0], row[1]
+for _, row in mp_df.iterrows():
+    name = row[0]
+    divs = row[1]
     if name and divs:
-        div_list = [d.strip().title() for d in divs.split(",") if d.strip()]
+        div_list = [d.strip().title() for d in str(divs).split(",") if d.strip()]
         preferences[name] = div_list
 
 # --- Filter absentees ---
@@ -58,117 +57,82 @@ if num_members == 0:
     st.error("❌ No active team members available for assignment!")
     st.stop()
 
-# --- Build QA data ---
-qa_rows = []
-brand_rows = defaultdict(list)
-priority_rows = []
-priority_override_rows = []
-normal_rows = []
+# --- Prepare QA data ---
+qa_df['AssignedTo'] = None
+qa_df['PriorityOverride'] = qa_df.iloc[:, 32].combine_first(qa_df.iloc[:, 33])  # AG/AH columns
+qa_df['AQDate'] = qa_df.iloc[:, 42]  # AQ column
+qa_df['Division'] = qa_df.iloc[:, 17].astype(str).str.strip().str.title()
+qa_df['Brand'] = qa_df.iloc[:, 14].astype(str).str.strip().str.title()
+qa_df['Workflow'] = qa_df.iloc[:, 8].astype(str).str.strip()
 
-for i, row in enumerate(qa_ws.iter_rows(min_row=2, values_only=True), start=2):
-    assigned_to = row[0]
-    division = str(row[17]).strip() if row[17] else ""
-    m_value = row[12]
-    brand = row[14]
-    workflow = str(row[8]).strip() if row[8] else ""
-    col_ag = row[32]  # AG
-    col_ah = row[33]  # AH
-    col_aq = row[42]  # AQ (for backlog)
-
-    # Priority override
-    if isinstance(col_ag, (int, float)) or isinstance(col_ah, (int, float)):
-        priority_override_rows.append((i, division, brand, workflow, col_aq))
-
-    if m_value is not None and str(m_value).strip() != "":
-        qa_rows.append((i, assigned_to, division, brand, workflow, col_aq))
-        brand_rows[brand].append((i, division, workflow, col_aq))
-        if workflow == "Prioritise in Workflow":
-            priority_rows.append((i, division, brand, workflow, col_aq))
-        else:
-            normal_rows.append((i, division, brand, workflow, col_aq))
-
-# --- Apply backlog sorting ---
+# --- Backlog sorting ---
 if backlog_mode:
     st.info("🕐 Backlog mode ON — sorting all rows by earliest AQ date.")
-    def sort_key(x):
-        date_val = x[-1]
-        return date_val if isinstance(date_val, datetime) else datetime.max
-    qa_rows.sort(key=sort_key)
-    priority_override_rows.sort(key=sort_key)
-    priority_rows.sort(key=sort_key)
-    normal_rows.sort(key=sort_key)
-    for brand in brand_rows:
-        brand_rows[brand].sort(key=sort_key)
+    qa_df.sort_values('AQDate', inplace=True)
 else:
     st.success("🚀 Backlog mode OFF — assigning in normal order.")
 
-# --- Assignment trackers ---
-assignments = {name: [] for name in team_members}
-counts = {name: 0 for name in team_members}
+# --- Assignment logic helpers ---
 DEFAULT_TARGET = 100
+counts = {member: 0 for member in team_members}
+assignments = {member: [] for member in team_members}
 
 def member_limit(member):
     return custom_limits.get(member, DEFAULT_TARGET)
 
-def assign_rows(rows):
-    for r, div, brand, workflow, *_ in rows:
-        eligible = [m for m in team_members if counts[m] < member_limit(m)]
-        if not eligible:
-            qa_ws[f"A{r}"].value = "Backlog"
-            continue
-        chosen = min(eligible, key=lambda x: counts[x])
-        qa_ws[f"A{r}"].value = chosen
-        assignments[chosen].append(r)
-        counts[chosen] += 1
-
-def assign_brand_block(member, rows):
+def assign_block(member, rows_idx):
+    """Assign a block of rows to a member respecting their remaining capacity."""
     remaining_capacity = member_limit(member) - counts[member]
-    if remaining_capacity <= 0:
-        return 0
-    for r, div, workflow, *_ in rows[:remaining_capacity]:
-        qa_ws[f"A{r}"].value = member
-        assignments[member].append(r)
-        counts[member] += 1
-    return len(rows[:remaining_capacity])
+    assign_count = min(len(rows_idx), remaining_capacity)
+    if assign_count <= 0:
+        return
+    qa_df.loc[rows_idx[:assign_count], 'AssignedTo'] = member
+    assignments[member].extend(rows_idx[:assign_count])
+    counts[member] += assign_count
 
-# --- Stage 4 assignment logic ---
-if priority_override_rows:
-    st.info(f"🚨 Found {len(priority_override_rows)} AG/AH priority rows. Assigning first...")
-    assign_rows(priority_override_rows)
-else:
-    st.success("✅ No AG/AH priority rows found.")
-
-# Preferred divisions
-for member in team_members:
-    prefs = active_preferences[member]
-    for pref_div in prefs:
-        for brand, rows in brand_rows.items():
-            unassigned = [r for r in rows if qa_ws[f"A{r[0]}"].value in [None, ""] and r[1] == pref_div]
-            if unassigned:
-                assign_brand_block(member, unassigned)
-
-# Remaining brands
-for brand, rows in brand_rows.items():
-    unassigned = [r for r in rows if qa_ws[f"A{r[0]}"].value in [None, ""]]
-    if not unassigned:
-        continue
+# --- Step 1: Assign priority override rows first ---
+priority_override_rows = qa_df[qa_df['PriorityOverride'].notna()]
+for idx, row in priority_override_rows.iterrows():
     eligible = [m for m in team_members if counts[m] < member_limit(m)]
     if eligible:
         chosen = min(eligible, key=lambda x: counts[x])
-        assign_brand_block(chosen, unassigned)
+        qa_df.at[idx, 'AssignedTo'] = chosen
+        assignments[chosen].append(idx)
+        counts[chosen] += 1
     else:
-        for r, div, workflow, *_ in unassigned:
-            qa_ws[f"A{r}"].value = "Backlog"
+        qa_df.at[idx, 'AssignedTo'] = "Backlog"
 
-# Convert formulas to values
-for row in qa_ws.iter_rows():
-    for cell in row:
-        if cell.data_type == "f":
-            cell.value = cell.value
+# --- Step 2: Assign preferred divisions with brand + workflow priority ---
+for member in team_members:
+    prefs = active_preferences[member]
+    for pref_div in prefs:
+        # Group unassigned rows by brand
+        unassigned_df = qa_df[(qa_df['AssignedTo'].isna()) & (qa_df['Division'] == pref_div)]
+        for brand, brand_group in unassigned_df.groupby('Brand'):
+            # Workflow prioritization: assign "Prioritise in Workflow" first
+            priority_rows = brand_group[brand_group['Workflow'] == "Prioritise in Workflow"].index.tolist()
+            normal_rows = brand_group[brand_group['Workflow'] != "Prioritise in Workflow"].index.tolist()
+            
+            assign_block(member, priority_rows)
+            assign_block(member, normal_rows)
+
+# --- Step 3: Assign remaining unassigned rows ---
+unassigned_idx = qa_df[qa_df['AssignedTo'].isna()].index
+for idx in unassigned_idx:
+    eligible = [m for m in team_members if counts[m] < member_limit(m)]
+    if eligible:
+        chosen = min(eligible, key=lambda x: counts[x])
+        qa_df.at[idx, 'AssignedTo'] = chosen
+        assignments[chosen].append(idx)
+        counts[chosen] += 1
+    else:
+        qa_df.at[idx, 'AssignedTo'] = "Backlog"
 
 # --- Prepare file for download ---
 output_buffer = BytesIO()
-wb.save(output_buffer)
+with pd.ExcelWriter(output_buffer, engine='openpyxl') as writer:
+    qa_df.to_excel(writer, sheet_name="QA", index=False)
+    mp_df.to_excel(writer, sheet_name="MP", index=False)
 output_buffer.seek(0)
 
 st.download_button(
@@ -183,5 +147,5 @@ st.subheader("📊 Summary of assignments:")
 for name, rows in assignments.items():
     st.write(f"- {name}: {len(rows)} products (Limit: {member_limit(name)})")
 
-backlog_count = sum(1 for r in qa_rows if qa_ws[f"A{r[0]}"].value == "Backlog")
+backlog_count = (qa_df['AssignedTo'] == "Backlog").sum()
 st.write(f"- Backlog: {backlog_count} products")
