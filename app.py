@@ -17,7 +17,7 @@ if uploaded_file is None:
 wb = load_workbook(uploaded_file)
 qa_ws = wb["QA"]
 
-# Load QA sheet to pandas for fast manipulation
+# Load QA sheet to pandas
 qa_df = pd.DataFrame(qa_ws.values)
 qa_df.columns = qa_df.iloc[0]
 qa_df = qa_df[1:].reset_index(drop=True)
@@ -45,7 +45,7 @@ if custom_input:
             except ValueError:
                 st.warning(f"⚠️ Invalid limit for {name}, ignoring.")
 
-# --- Read preferences from all sheets ---
+# --- Read preferences ---
 mp_ws = wb["MP"]
 preferences = {}
 for row in mp_ws.iter_rows(min_row=2, values_only=True):
@@ -69,6 +69,7 @@ qa_df['AQDate'] = qa_df.iloc[:, 42]
 qa_df['Division'] = qa_df.iloc[:, 17].astype(str).str.strip().str.title()
 qa_df['Brand'] = qa_df.iloc[:, 14].astype(str).str.strip().str.title()
 qa_df['Workflow'] = qa_df.iloc[:, 8].astype(str).str.strip()
+qa_df['Pim Parent ID'] = qa_df['Pim Parent ID'].astype(str).str.strip()
 
 if backlog_mode:
     qa_df.sort_values('AQDate', inplace=True)
@@ -80,61 +81,71 @@ assignments = {m: [] for m in team_members}
 def member_limit(member):
     return custom_limits.get(member, DEFAULT_TARGET)
 
-# --- Filter only populated rows ---
-populated_df = qa_df[qa_df['Brand'].notna() & qa_df['Division'].notna()]
+# --- Filter only rows with Pim Parent ID ---
+product_df = qa_df[qa_df['Pim Parent ID'].notna()].copy()
 
-# --- Step 1: Priority overrides ---
-priority_override_rows = populated_df[populated_df['PriorityOverride'].notna()]
-for idx, row in priority_override_rows.iterrows():
-    eligible = [m for m in team_members if counts[m] < member_limit(m)]
-    if eligible:
-        chosen = min(eligible, key=lambda x: counts[x])
-        qa_df.at[idx, 'Assigned'] = chosen
-        assignments[chosen].append(idx)
-        counts[chosen] += 1
-    else:
-        qa_df.at[idx, 'Assigned'] = "Backlog"
+# --- GLOBAL ASSIGNMENT STRATEGY ---
 
-# --- Step 2: Preferred divisions with brand + workflow ---
+# 1️⃣ Assign by team member preferences (preferred divisions first)
 for member in team_members:
     prefs = active_preferences[member]
     for pref_div in prefs:
-        # Only consider unassigned and populated rows
-        unassigned_df = qa_df[(qa_df['Assigned'].isna()) & 
-                              (qa_df['Division'] == pref_div) & 
-                              qa_df['Brand'].notna()]
-        for brand, brand_group in unassigned_df.groupby('Brand'):
-            rows_idx = brand_group.index.tolist()
+        div_rows = product_df[(product_df['Assigned'].isna()) & (product_df['Division'] == pref_div)]
+        # Group by Brand for global brand-aware assignment
+        brand_groups = div_rows.groupby('Brand')
+        for brand, group in brand_groups:
+            rows_idx = group.index.tolist()
+            # Try to assign entire brand if member has enough capacity
             remaining_capacity = member_limit(member) - counts[member]
+            if remaining_capacity >= len(rows_idx):
+                product_df.loc[rows_idx, 'Assigned'] = member
+                assignments[member].extend(rows_idx)
+                counts[member] += len(rows_idx)
+            else:
+                # Assign as much as fits
+                assign_count = remaining_capacity
+                if assign_count > 0:
+                    product_df.loc[rows_idx[:assign_count], 'Assigned'] = member
+                    assignments[member].extend(rows_idx[:assign_count])
+                    counts[member] += assign_count
+                # Remaining rows will be assigned in global brand pass
 
-            # Assign as much as possible of this brand to this member
-            while rows_idx and remaining_capacity > 0:
-                assign_count = min(len(rows_idx), remaining_capacity)
-                assign_rows = rows_idx[:assign_count]
-                
-                qa_df.loc[assign_rows, 'Assigned'] = member
-                assignments[member].extend(assign_rows)
-                counts[member] += assign_count
-
-                # Remove assigned rows from the brand group
-                rows_idx = rows_idx[assign_count:]
-                remaining_capacity = member_limit(member) - counts[member]
-
-# --- Step 3: Remaining unassigned rows ---
-unassigned_idx = qa_df[qa_df['Assigned'].isna() & qa_df['Brand'].notna()].index
-for idx in unassigned_idx:
+# 2️⃣ Assign priority override products next
+priority_rows = product_df[(product_df['Assigned'].isna()) & (product_df['PriorityOverride'].notna())]
+for idx, row in priority_rows.iterrows():
     eligible = [m for m in team_members if counts[m] < member_limit(m)]
     if eligible:
         chosen = min(eligible, key=lambda x: counts[x])
-        qa_df.at[idx, 'Assigned'] = chosen
+        product_df.at[idx, 'Assigned'] = chosen
         assignments[chosen].append(idx)
         counts[chosen] += 1
     else:
-        qa_df.at[idx, 'Assigned'] = "Backlog"
+        product_df.at[idx, 'Assigned'] = "Backlog"
 
-# --- Write assignments back to original QA sheet ---
+# 3️⃣ Assign remaining products globally by brand (minimize splits)
+remaining_rows = product_df[product_df['Assigned'].isna()]
+brand_groups = remaining_rows.groupby('Brand')
+
+for brand, group in brand_groups:
+    rows_idx = group.index.tolist()
+    while rows_idx:
+        # Choose member with most remaining capacity
+        eligible = [m for m in team_members if counts[m] < member_limit(m)]
+        if not eligible:
+            product_df.loc[rows_idx, 'Assigned'] = "Backlog"
+            break
+        chosen = max(eligible, key=lambda m: member_limit(m) - counts[m])
+        remaining_capacity = member_limit(chosen) - counts[chosen]
+        assign_count = min(len(rows_idx), remaining_capacity)
+        assign_rows = rows_idx[:assign_count]
+        product_df.loc[assign_rows, 'Assigned'] = chosen
+        assignments[chosen].extend(assign_rows)
+        counts[chosen] += assign_count
+        rows_idx = rows_idx[assign_count:]
+
+# --- Write assignments back to QA sheet ---
 if 'Assigned' not in [cell.value for cell in qa_ws[1]]:
-    qa_ws.insert_cols(1)  # Insert column A if not present
+    qa_ws.insert_cols(1)
     qa_ws.cell(row=1, column=1, value='Assigned')
 
 assigned_col_idx = None
@@ -144,7 +155,11 @@ for col_idx, cell in enumerate(qa_ws[1], start=1):
         break
 
 for i, value in enumerate(qa_df['Assigned'], start=2):
-    qa_ws.cell(row=i, column=assigned_col_idx, value=value)
+    # Write back assigned value only for rows with Pim Parent ID
+    if pd.notna(qa_df.at[i-2, 'Pim Parent ID']):
+        qa_ws.cell(row=i, column=assigned_col_idx, value=product_df.at[i-2, 'Assigned'])
+    else:
+        qa_ws.cell(row=i, column=assigned_col_idx, value="")
 
 # --- Download workbook ---
 output_buffer = BytesIO()
@@ -163,5 +178,5 @@ st.subheader("📊 Summary of assignments:")
 for name, rows in assignments.items():
     st.write(f"- {name}: {len(rows)} products (Limit: {member_limit(name)})")
 
-backlog_count = (qa_df['Assigned'] == "Backlog").sum()
+backlog_count = (product_df['Assigned'] == "Backlog").sum()
 st.write(f"- Backlog: {backlog_count} products")
