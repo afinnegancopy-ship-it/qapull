@@ -1,43 +1,35 @@
-"""
-===========================
-QA Assignment Script — Stage 4 (Backlog Mode + Priority Override + Custom Limits + Preference Filter + Brand Blocks)
-===========================
-
-Stage 4 Features:no
-- NEW: "Backlog Mode" — if enabled, sorts all products by AQ date (earliest first)
-- Prioritizes rows where AG or AH contain numbers
-- Keeps all Stage 3 logic:
-  ✅ Absent members handled
-  ✅ Division preferences respected
-  ✅ Brand blocks stay together
-  ✅ Per-member custom limits
-  ✅ Balanced assignment
-  ✅ Backlog fallback
-"""
-
+import streamlit as st
 import openpyxl
 from openpyxl import load_workbook
 from datetime import datetime
 from collections import defaultdict
+from io import BytesIO
 
-# --- File path ---
-file_path = r"\\BTBNAS\DigitalAssets\Photostudio\0 - Enrichment\QA\2025\PIM QA 2025\06.11.2025.xlsx"
+st.set_page_config(page_title="QA Assignment - Stage 4", layout="wide")
+st.title("📊 QA Assignment — Stage 4")
 
-# --- Ask for backlog mode ---
-backlog_mode_input = input("Are you expecting to be in backlog today? (yes/no): ").strip().lower()
-backlog_mode = backlog_mode_input in ["yes", "y"]
+# --- File upload ---
+uploaded_file = st.file_uploader("Upload QA Excel file", type=["xlsx"])
+if uploaded_file is None:
+    st.info("Please upload an Excel file to proceed.")
+    st.stop()
 
-# --- Ask for absentees ---
-absent_input = input("Is anyone absent today? (Type names separated by commas, or press Enter if no one is absent): ").strip().lower()
-absent_list = []
-if absent_input and absent_input not in ["no", "none", "n"]:
-    absent_list = [name.strip().title() for name in absent_input.split(",") if name.strip()]
-    print(f"🟡 Absent today: {', '.join(absent_list)}")
+# --- Load workbook ---
+wb = load_workbook(uploaded_file)
+qa_ws = wb["QA"]
+mp_ws = wb["MP"]
+
+# --- Streamlit inputs ---
+backlog_mode = st.radio("Are you expecting to be in backlog today?", ["No", "Yes"]) == "Yes"
+
+absent_input = st.text_input("Type names of absent members (comma-separated)").strip()
+absent_list = [name.strip().title() for name in absent_input.split(",") if name.strip()]
+if absent_list:
+    st.warning(f"🟡 Absent today: {', '.join(absent_list)}")
 else:
-    print("✅ Everyone is present.")
+    st.success("✅ Everyone is present.")
 
-# --- Ask for custom product limits ---
-custom_input = input("Does any member have a specific product count limit? (format: Name:Limit, separated by commas, or press Enter for none): ").strip()
+custom_input = st.text_input("Specify custom product limits (Name:Limit, comma-separated)").strip()
 custom_limits = {}
 if custom_input:
     for entry in custom_input.split(","):
@@ -48,14 +40,9 @@ if custom_input:
                 limit = int(limit.strip())
                 custom_limits[name] = limit
             except ValueError:
-                print(f"⚠️ Invalid limit for {name}, ignoring.")
+                st.warning(f"⚠️ Invalid limit for {name}, ignoring.")
 
-# --- Load workbook safely ---
-wb = load_workbook(file_path)
-qa_ws = wb["QA"]
-mp_ws = wb["MP"]
-
-# --- Read mapping (MP sheet) with multiple preferences ---
+# --- Read preferences from MP sheet ---
 preferences = {}
 for row in mp_ws.iter_rows(min_row=2, values_only=True):
     name, divs = row[0], row[1]
@@ -63,18 +50,19 @@ for row in mp_ws.iter_rows(min_row=2, values_only=True):
         div_list = [d.strip().title() for d in divs.split(",") if d.strip()]
         preferences[name] = div_list
 
-# --- Filter out absentees ---
+# --- Filter absentees ---
 active_preferences = {name: divs for name, divs in preferences.items() if name not in absent_list}
 team_members = list(active_preferences.keys())
 num_members = len(team_members)
 if num_members == 0:
-    raise ValueError("❌ No active team members available for assignment!")
+    st.error("❌ No active team members available for assignment!")
+    st.stop()
 
 # --- Build QA data ---
 qa_rows = []
 brand_rows = defaultdict(list)
 priority_rows = []
-priority_override_rows = []  # AG/AH numeric priority
+priority_override_rows = []
 normal_rows = []
 
 for i, row in enumerate(qa_ws.iter_rows(min_row=2, values_only=True), start=2):
@@ -83,11 +71,11 @@ for i, row in enumerate(qa_ws.iter_rows(min_row=2, values_only=True), start=2):
     m_value = row[12]
     brand = row[14]
     workflow = str(row[8]).strip() if row[8] else ""
-    col_ag = row[32]  # Column AG
-    col_ah = row[33]  # Column AH
-    col_aq = row[42]  # Column AQ (for backlog mode)
+    col_ag = row[32]  # AG
+    col_ah = row[33]  # AH
+    col_aq = row[42]  # AQ (for backlog)
 
-    # Detect Stage 3 priority (AG or AH numeric)
+    # Priority override
     if isinstance(col_ag, (int, float)) or isinstance(col_ah, (int, float)):
         priority_override_rows.append((i, division, brand, workflow, col_aq))
 
@@ -99,9 +87,9 @@ for i, row in enumerate(qa_ws.iter_rows(min_row=2, values_only=True), start=2):
         else:
             normal_rows.append((i, division, brand, workflow, col_aq))
 
-# --- Apply backlog sorting if needed ---
+# --- Apply backlog sorting ---
 if backlog_mode:
-    print("🕐 Backlog mode ON — sorting all rows by earliest AQ date.")
+    st.info("🕐 Backlog mode ON — sorting all rows by earliest AQ date.")
     def sort_key(x):
         date_val = x[-1]
         return date_val if isinstance(date_val, datetime) else datetime.max
@@ -112,18 +100,16 @@ if backlog_mode:
     for brand in brand_rows:
         brand_rows[brand].sort(key=sort_key)
 else:
-    print("🚀 Backlog mode OFF — assigning in normal order.")
+    st.success("🚀 Backlog mode OFF — assigning in normal order.")
 
-# --- Initialize assignment trackers ---
+# --- Assignment trackers ---
 assignments = {name: [] for name in team_members}
 counts = {name: 0 for name in team_members}
 DEFAULT_TARGET = 100
 
-# --- Helper: get member's current limit ---
 def member_limit(member):
     return custom_limits.get(member, DEFAULT_TARGET)
 
-# --- Helper: assign individual rows (used for priority overrides) ---
 def assign_rows(rows):
     for r, div, brand, workflow, *_ in rows:
         eligible = [m for m in team_members if counts[m] < member_limit(m)]
@@ -135,7 +121,6 @@ def assign_rows(rows):
         assignments[chosen].append(r)
         counts[chosen] += 1
 
-# --- Helper: assign brand blocks ---
 def assign_brand_block(member, rows):
     remaining_capacity = member_limit(member) - counts[member]
     if remaining_capacity <= 0:
@@ -146,14 +131,14 @@ def assign_brand_block(member, rows):
         counts[member] += 1
     return len(rows[:remaining_capacity])
 
-# --- STAGE 4 STEP 1️⃣: Assign AG/AH priority rows first ---
+# --- Stage 4 assignment logic ---
 if priority_override_rows:
-    print(f"\n🚨 Found {len(priority_override_rows)} AG/AH priority rows. Assigning first...")
+    st.info(f"🚨 Found {len(priority_override_rows)} AG/AH priority rows. Assigning first...")
     assign_rows(priority_override_rows)
 else:
-    print("\n✅ No AG/AH priority rows found.")
+    st.success("✅ No AG/AH priority rows found.")
 
-# --- STAGE 4 STEP 2️⃣: Assign preferred divisions next ---
+# Preferred divisions
 for member in team_members:
     prefs = active_preferences[member]
     for pref_div in prefs:
@@ -162,7 +147,7 @@ for member in team_members:
             if unassigned:
                 assign_brand_block(member, unassigned)
 
-# --- STAGE 4 STEP 3️⃣: Assign remaining brands normally ---
+# Remaining brands
 for brand, rows in brand_rows.items():
     unassigned = [r for r in rows if qa_ws[f"A{r[0]}"].value in [None, ""]]
     if not unassigned:
@@ -175,24 +160,28 @@ for brand, rows in brand_rows.items():
         for r, div, workflow, *_ in unassigned:
             qa_ws[f"A{r}"].value = "Backlog"
 
-# --- Convert formulas to values ---
+# Convert formulas to values
 for row in qa_ws.iter_rows():
     for cell in row:
         if cell.data_type == "f":
             cell.value = cell.value
 
-# --- Save timestamped file ---
-timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-file_base, file_ext = file_path.rsplit(".", 1)
-output_path = f"{file_base}_{timestamp}.xlsx"
-wb.save(output_path)
+# --- Prepare file for download ---
+output_buffer = BytesIO()
+wb.save(output_buffer)
+output_buffer.seek(0)
+
+st.download_button(
+    label="📥 Download Assigned QA Excel",
+    data=output_buffer,
+    file_name=f"QA_Assigned_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+)
 
 # --- Summary ---
-print("\n✅ Assignment complete!")
-print(f"📄 Saved as: {output_path}")
-print("\n📊 Summary of assignments:")
+st.subheader("📊 Summary of assignments:")
 for name, rows in assignments.items():
-    limit = member_limit(name)
-    print(f"  - {name}: {len(rows)} products (Limit: {limit})")
+    st.write(f"- {name}: {len(rows)} products (Limit: {member_limit(name)})")
+
 backlog_count = sum(1 for r in qa_rows if qa_ws[f"A{r[0]}"].value == "Backlog")
-print(f"  - Backlog: {backlog_count} products")
+st.write(f"- Backlog: {backlog_count} products")
