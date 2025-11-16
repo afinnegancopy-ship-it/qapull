@@ -69,7 +69,6 @@ qa_df['AQDate'] = qa_df.iloc[:, 42]
 qa_df['Division'] = qa_df.iloc[:, 17].astype(str).str.strip().str.title()
 qa_df['Brand'] = qa_df.iloc[:, 14].astype(str).str.strip().str.title()
 qa_df['Workflow'] = qa_df.iloc[:, 8].astype(str).str.strip()
-qa_df['Pim Parent ID'] = qa_df['Pim Parent ID'].astype(str).str.strip()
 
 if backlog_mode:
     qa_df.sort_values('AQDate', inplace=True)
@@ -81,8 +80,8 @@ assignments = {m: [] for m in team_members}
 def member_limit(member):
     return custom_limits.get(member, DEFAULT_TARGET)
 
-# --- Filter only rows with Pim Parent ID ---
-product_df = qa_df[qa_df['Pim Parent ID'].notna()].copy()
+# --- Filter only rows with Column M populated ---
+product_df = qa_df[qa_df.iloc[:, 12].notna()].copy()
 
 # --- GLOBAL ASSIGNMENT STRATEGY ---
 
@@ -91,26 +90,21 @@ for member in team_members:
     prefs = active_preferences[member]
     for pref_div in prefs:
         div_rows = product_df[(product_df['Assigned'].isna()) & (product_df['Division'] == pref_div)]
-        # Group by Brand for global brand-aware assignment
-        brand_groups = div_rows.groupby('Brand')
-        for brand, group in brand_groups:
+        # Group by Brand for brand-aware assignment
+        for brand, group in div_rows.groupby('Brand'):
             rows_idx = group.index.tolist()
-            # Try to assign entire brand if member has enough capacity
             remaining_capacity = member_limit(member) - counts[member]
             if remaining_capacity >= len(rows_idx):
                 product_df.loc[rows_idx, 'Assigned'] = member
                 assignments[member].extend(rows_idx)
                 counts[member] += len(rows_idx)
             else:
-                # Assign as much as fits
-                assign_count = remaining_capacity
-                if assign_count > 0:
-                    product_df.loc[rows_idx[:assign_count], 'Assigned'] = member
-                    assignments[member].extend(rows_idx[:assign_count])
-                    counts[member] += assign_count
-                # Remaining rows will be assigned in global brand pass
+                if remaining_capacity > 0:
+                    product_df.loc[rows_idx[:remaining_capacity], 'Assigned'] = member
+                    assignments[member].extend(rows_idx[:remaining_capacity])
+                    counts[member] += remaining_capacity
 
-# 2️⃣ Assign priority override products next
+# 2️⃣ Assign priority override products
 priority_rows = product_df[(product_df['Assigned'].isna()) & (product_df['PriorityOverride'].notna())]
 for idx, row in priority_rows.iterrows():
     eligible = [m for m in team_members if counts[m] < member_limit(m)]
@@ -124,12 +118,9 @@ for idx, row in priority_rows.iterrows():
 
 # 3️⃣ Assign remaining products globally by brand (minimize splits)
 remaining_rows = product_df[product_df['Assigned'].isna()]
-brand_groups = remaining_rows.groupby('Brand')
-
-for brand, group in brand_groups:
+for brand, group in remaining_rows.groupby('Brand'):
     rows_idx = group.index.tolist()
     while rows_idx:
-        # Choose member with most remaining capacity
         eligible = [m for m in team_members if counts[m] < member_limit(m)]
         if not eligible:
             product_df.loc[rows_idx, 'Assigned'] = "Backlog"
@@ -155,8 +146,7 @@ for col_idx, cell in enumerate(qa_ws[1], start=1):
         break
 
 for i, value in enumerate(qa_df['Assigned'], start=2):
-    # Write back assigned value only for rows with Pim Parent ID
-    if pd.notna(qa_df.at[i-2, 'Pim Parent ID']):
+    if pd.notna(qa_df.iloc[i-2, 12]):
         qa_ws.cell(row=i, column=assigned_col_idx, value=product_df.at[i-2, 'Assigned'])
     else:
         qa_ws.cell(row=i, column=assigned_col_idx, value="")
@@ -173,10 +163,26 @@ st.download_button(
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 )
 
-# --- Summary ---
-st.subheader("📊 Summary of assignments:")
-for name, rows in assignments.items():
-    st.write(f"- {name}: {len(rows)} products (Limit: {member_limit(name)})")
+# --- Dashboard & Summary ---
+st.subheader("📊 Summary of Assignments")
+
+summary_data = []
+for name in team_members:
+    assigned_count = len(assignments[name])
+    limit = member_limit(name)
+    remaining = limit - counts[name]
+    summary_data.append({
+        "Team Member": name,
+        "Assigned": assigned_count,
+        "Limit": limit,
+        "Remaining Capacity": remaining
+    })
+
+summary_df = pd.DataFrame(summary_data)
+st.dataframe(summary_df)
 
 backlog_count = (product_df['Assigned'] == "Backlog").sum()
-st.write(f"- Backlog: {backlog_count} products")
+st.write(f"**Backlog:** {backlog_count} products")
+
+# Optional: bar chart for visual
+st.bar_chart(summary_df.set_index("Team Member")["Assigned"])
