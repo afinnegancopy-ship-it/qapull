@@ -3,8 +3,8 @@ import pandas as pd
 from io import BytesIO
 from datetime import datetime
 
-st.set_page_config(page_title="QA Assignment - Stage 4", layout="wide")
-st.title("📊 QA Assignment — Stage 4")
+st.set_page_config(page_title="QA Assignment", layout="wide")
+st.title("📊 QA Assignment")
 
 # --- File upload ---
 uploaded_file = st.file_uploader("Upload QA Excel file", type=["xlsx"])
@@ -146,3 +146,4 @@ for name, rows in assignments.items():
 
 backlog_count = (qa_df['Assigned'] == "Backlog").sum()
 st.write(f"- Backlog: {backlog_count} products")
+
