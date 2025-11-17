@@ -6,7 +6,6 @@ from collections import defaultdict
 from io import BytesIO
 
 st.set_page_config(page_title="QA Assignment Tool", layout="wide")
-
 st.title("📊 QA Assignment Tool")
 
 # --- Upload Excel file ---
@@ -15,7 +14,7 @@ if uploaded_file is None:
     st.warning("Please upload an Excel file to proceed.")
     st.stop()
 
-# --- Ask for backlog mode ---
+# --- Backlog mode checkbox ---
 backlog_mode = st.checkbox("Backlog mode?", value=False, help="Sort by earliest AQ date if enabled.")
 
 # --- Input active members ---
@@ -27,7 +26,7 @@ if not working_input:
     st.warning("Please enter at least one team member.")
     st.stop()
 
-# --- Process member input ---
+# --- Process members ---
 active_members = []
 custom_limits = {}
 for part in working_input.split(","):
@@ -74,14 +73,13 @@ qa_rows = []
 for i, row in enumerate(qa_ws.iter_rows(min_row=2, values_only=True), start=2):
     m_value = row[12]
     brand = row[14]
-    workflow = str(row[8]).strip() if row[8] else ""
     col_aq = row[42]
     if m_value is not None and str(m_value).strip() != "":
-        qa_rows.append((i, brand, workflow, col_aq))
+        qa_rows.append((i, brand, col_aq))
         if brand:
             brand_blocks[brand.strip().title()].append(i)
 
-# --- Apply backlog sorting if needed ---
+# --- Backlog sorting ---
 if backlog_mode:
     st.info("🕐 Backlog mode ON — sorting all rows by earliest AQ date.")
     def sort_key(row_idx):
@@ -128,33 +126,25 @@ for brand, rows in brand_blocks.items():
                 continue
             member = max(eligible, key=lambda x: member_limits[x] - counts[x])
         for r in rows:
-            qa_ws[f"A{r}"].value = member
-            assignments[member].append(r)
-            counts[member] += 1
+            if counts[member] < member_limits[member]:
+                qa_ws[f"A{r}"].value = member
+                assignments[member].append(r)
+                counts[member] += 1
+            else:
+                qa_ws[f"A{r}"].value = "Backlog"
 
 # --- Step 2: Assign remaining ---
 for brand, rows in brand_blocks.items():
     unassigned = [r for r in rows if qa_ws[f"A{r}"].value in [None, ""]]
-    if not unassigned:
-        continue
-    block_size = len(unassigned)
-    eligible = [m for m in active_members if counts[m] + block_size <= member_limits[m]]
-    if eligible:
-        member = min(eligible, key=lambda x: counts[x])
-        for r in unassigned:
+    for r in unassigned:
+        eligible = [m for m in active_members if counts[m] < member_limits[m]]
+        if not eligible:
+            qa_ws[f"A{r}"].value = "Backlog"
+        else:
+            member = max(eligible, key=lambda x: member_limits[x] - counts[x])
             qa_ws[f"A{r}"].value = member
             assignments[member].append(r)
             counts[member] += 1
-    else:
-        for r in unassigned:
-            eligible_split = [m for m in active_members if counts[m] < member_limits[m]]
-            if not eligible_split:
-                qa_ws[f"A{r}"].value = "Backlog"
-            else:
-                member = min(eligible_split, key=lambda x: counts[x])
-                qa_ws[f"A{r}"].value = member
-                assignments[member].append(r)
-                counts[member] += 1
 
 # --- Convert formulas to values ---
 for row in qa_ws.iter_rows():
@@ -162,7 +152,7 @@ for row in qa_ws.iter_rows():
         if cell.data_type == "f":
             cell.value = cell.value
 
-# --- Save to BytesIO for download ---
+# --- Save to BytesIO ---
 output = BytesIO()
 timestamp = datetime.now().strftime("%Y%m%d_%H%M")
 wb.save(output)
