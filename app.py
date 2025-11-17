@@ -1,6 +1,5 @@
 import streamlit as st
 import pandas as pd
-from openpyxl import load_workbook
 from io import BytesIO
 from datetime import datetime
 
@@ -13,14 +12,9 @@ if uploaded_file is None:
     st.info("Please upload an Excel file to proceed.")
     st.stop()
 
-# --- Load workbook and QA sheet ---
-wb = load_workbook(uploaded_file)
-qa_ws = wb["QA"]
-
-# Load QA sheet to pandas
-qa_df = pd.DataFrame(qa_ws.values)
-qa_df.columns = qa_df.iloc[0]
-qa_df = qa_df[1:].reset_index(drop=True)
+# --- Load sheets directly with pandas ---
+qa_df = pd.read_excel(uploaded_file, sheet_name="QA")
+mp_df = pd.read_excel(uploaded_file, sheet_name="MP")
 
 # --- Streamlit inputs ---
 backlog_mode = st.radio("Are you expecting to be in backlog today?", ["No", "Yes"]) == "Yes"
@@ -45,10 +39,9 @@ if custom_input:
             except ValueError:
                 st.warning(f"⚠️ Invalid limit for {name}, ignoring.")
 
-# --- Read preferences ---
-mp_ws = wb["MP"]
+# --- Preferences ---
 preferences = {}
-for row in mp_ws.iter_rows(min_row=2, values_only=True):
+for _, row in mp_df.iterrows():
     name, divs = row[0], row[1]
     if name and divs:
         div_list = [d.strip().title() for d in str(divs).split(",") if d.strip()]
@@ -75,7 +68,6 @@ if backlog_mode:
 
 DEFAULT_TARGET = 100
 counts = {m: 0 for m in team_members}
-assignments = {m: [] for m in team_members}
 
 def member_limit(member):
     return custom_limits.get(member, DEFAULT_TARGET)
@@ -83,43 +75,35 @@ def member_limit(member):
 # --- Filter only rows with Column M populated ---
 product_df = qa_df[qa_df.iloc[:, 12].notna()].copy()
 
-# --- GLOBAL ASSIGNMENT STRATEGY ---
-
-# 1️⃣ Assign by team member preferences (preferred divisions first)
+# --- 1️⃣ Assign by preferences ---
 for member in team_members:
     prefs = active_preferences[member]
-    for pref_div in prefs:
-        div_rows = product_df[(product_df['Assigned'].isna()) & (product_df['Division'] == pref_div)]
-        # Group by Brand for brand-aware assignment
-        for brand, group in div_rows.groupby('Brand'):
-            rows_idx = group.index.tolist()
-            remaining_capacity = member_limit(member) - counts[member]
-            if remaining_capacity >= len(rows_idx):
-                product_df.loc[rows_idx, 'Assigned'] = member
-                assignments[member].extend(rows_idx)
-                counts[member] += len(rows_idx)
-            else:
-                if remaining_capacity > 0:
-                    product_df.loc[rows_idx[:remaining_capacity], 'Assigned'] = member
-                    assignments[member].extend(rows_idx[:remaining_capacity])
-                    counts[member] += remaining_capacity
+    for div in prefs:
+        mask = product_df['Assigned'].isna() & (product_df['Division'] == div)
+        rows_to_assign = product_df[mask].index
+        remaining_capacity = member_limit(member) - counts[member]
+        assign_count = min(len(rows_to_assign), remaining_capacity)
+        if assign_count > 0:
+            product_df.loc[rows_to_assign[:assign_count], 'Assigned'] = member
+            counts[member] += assign_count
 
-# 2️⃣ Assign priority override products
-priority_rows = product_df[(product_df['Assigned'].isna()) & (product_df['PriorityOverride'].notna())]
-for idx, row in priority_rows.iterrows():
+# --- 2️⃣ Assign priority override products ---
+priority_mask = product_df['Assigned'].isna() & product_df['PriorityOverride'].notna()
+for idx in product_df[priority_mask].index:
     eligible = [m for m in team_members if counts[m] < member_limit(m)]
     if eligible:
         chosen = min(eligible, key=lambda x: counts[x])
         product_df.at[idx, 'Assigned'] = chosen
-        assignments[chosen].append(idx)
         counts[chosen] += 1
     else:
         product_df.at[idx, 'Assigned'] = "Backlog"
 
-# 3️⃣ Assign remaining products globally by brand (minimize splits)
-remaining_rows = product_df[product_df['Assigned'].isna()]
-for brand, group in remaining_rows.groupby('Brand'):
-    rows_idx = group.index.tolist()
+# --- 3️⃣ Assign remaining products by brand globally ---
+remaining_mask = product_df['Assigned'].isna()
+brands = product_df.loc[remaining_mask, 'Brand'].unique()
+for brand in brands:
+    brand_mask = remaining_mask & (product_df['Brand'] == brand)
+    rows_idx = product_df[brand_mask].index.tolist()
     while rows_idx:
         eligible = [m for m in team_members if counts[m] < member_limit(m)]
         if not eligible:
@@ -128,32 +112,18 @@ for brand, group in remaining_rows.groupby('Brand'):
         chosen = max(eligible, key=lambda m: member_limit(m) - counts[m])
         remaining_capacity = member_limit(chosen) - counts[chosen]
         assign_count = min(len(rows_idx), remaining_capacity)
-        assign_rows = rows_idx[:assign_count]
-        product_df.loc[assign_rows, 'Assigned'] = chosen
-        assignments[chosen].extend(assign_rows)
+        product_df.loc[rows_idx[:assign_count], 'Assigned'] = chosen
         counts[chosen] += assign_count
         rows_idx = rows_idx[assign_count:]
 
-# --- Write assignments back to QA sheet ---
-if 'Assigned' not in [cell.value for cell in qa_ws[1]]:
-    qa_ws.insert_cols(1)
-    qa_ws.cell(row=1, column=1, value='Assigned')
+# --- Write assignments back ---
+qa_df['Assigned'] = qa_df.index.map(lambda idx: product_df.at[idx, 'Assigned'] if idx in product_df.index else "")
 
-assigned_col_idx = None
-for col_idx, cell in enumerate(qa_ws[1], start=1):
-    if cell.value == 'Assigned':
-        assigned_col_idx = col_idx
-        break
-
-for i, value in enumerate(qa_df['Assigned'], start=2):
-    if pd.notna(qa_df.iloc[i-2, 12]):
-        qa_ws.cell(row=i, column=assigned_col_idx, value=product_df.at[i-2, 'Assigned'])
-    else:
-        qa_ws.cell(row=i, column=assigned_col_idx, value="")
-
-# --- Download workbook ---
+# --- Download ---
 output_buffer = BytesIO()
-wb.save(output_buffer)
+with pd.ExcelWriter(output_buffer, engine='openpyxl') as writer:
+    qa_df.to_excel(writer, sheet_name="QA", index=False)
+    mp_df.to_excel(writer, sheet_name="MP", index=False)
 output_buffer.seek(0)
 
 st.download_button(
@@ -165,17 +135,15 @@ st.download_button(
 
 # --- Dashboard & Summary ---
 st.subheader("📊 Summary of Assignments")
-
 summary_data = []
-for name in team_members:
-    assigned_count = len(assignments[name])
-    limit = member_limit(name)
-    remaining = limit - counts[name]
+for member in team_members:
+    assigned_count = sum(product_df['Assigned'] == member)
+    limit = member_limit(member)
     summary_data.append({
-        "Team Member": name,
+        "Team Member": member,
         "Assigned": assigned_count,
         "Limit": limit,
-        "Remaining Capacity": remaining
+        "Remaining Capacity": limit - assigned_count
     })
 
 summary_df = pd.DataFrame(summary_data)
@@ -184,5 +152,4 @@ st.dataframe(summary_df)
 backlog_count = (product_df['Assigned'] == "Backlog").sum()
 st.write(f"**Backlog:** {backlog_count} products")
 
-# Optional: bar chart for visual
 st.bar_chart(summary_df.set_index("Team Member")["Assigned"])
