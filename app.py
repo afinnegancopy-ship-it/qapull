@@ -5,7 +5,7 @@ from datetime import datetime
 from openpyxl import load_workbook
 
 st.set_page_config(page_title="QA Assignment", layout="wide")
-st.title("📊 QA Assignment")
+st.title("📊 QA Assignment (Deterministic)")
 
 # --- Upload workbook ---
 uploaded_file = st.file_uploader("Upload QA Excel file", type=["xlsx"])
@@ -21,16 +21,10 @@ mp_df = pd.read_excel(uploaded_file, sheet_name="MP")
 uploaded_file.seek(0)
 assignments_df = pd.read_excel(uploaded_file, sheet_name="Assignments")
 
-# --- Streamlit inputs ---
+# --- Inputs ---
 backlog_mode = st.radio("Are you expecting to be in backlog today?", ["No", "Yes"]) == "Yes"
-
 absent_input = st.text_input("Type names of absent members (comma-separated)").strip()
 absent_list = [name.strip().title() for name in absent_input.split(",") if name.strip()]
-if absent_list:
-    st.warning(f"🟡 Absent today: {', '.join(absent_list)}")
-else:
-    st.success("✅ Everyone is present.")
-
 custom_input = st.text_input("Specify custom product limits (Name:Limit, comma-separated)").strip()
 custom_limits = {}
 if custom_input:
@@ -54,7 +48,7 @@ for _, row in mp_df.iterrows():
 
 # --- Active team members ---
 active_preferences = {name: divs for name, divs in preferences.items() if name not in absent_list}
-team_members = list(active_preferences.keys())
+team_members = sorted(active_preferences.keys())  # deterministic order
 num_members = len(team_members)
 if num_members == 0:
     st.error("❌ No active team members available for assignment!")
@@ -67,31 +61,27 @@ qa_df['AQDate'] = qa_df.iloc[:, 42]
 qa_df['Division'] = qa_df.iloc[:, 17].astype(str).str.strip().str.title()
 qa_df['Brand'] = qa_df.iloc[:, 14].astype(str).str.strip().str.title()
 qa_df['Workflow'] = qa_df.iloc[:, 8].astype(str).str.strip()
-
 if backlog_mode:
     qa_df.sort_values('AQDate', inplace=True)
 
 DEFAULT_TARGET = 100
 counts = {m: 0 for m in team_members}
-
 def member_limit(member):
     return custom_limits.get(member, DEFAULT_TARGET)
 
-# --- Filter only rows with Column M populated ---
 product_df = qa_df[qa_df.iloc[:, 12].notna()].copy()
 total_products = len(product_df)
 
-# --- Perfectly fair targets per member ---
+# --- Even target per member ---
 base_target = total_products // num_members
 remainder = total_products % num_members
 ideal_targets = {m: min(member_limit(m), base_target) for m in team_members}
-sorted_members = sorted(team_members)
 for i in range(remainder):
-    member = sorted_members[i % len(team_members)]
-    ideal_targets[member] = min(member_limit(member), ideal_targets[member] + 1)
+    ideal_targets[team_members[i % len(team_members)]] += 1
 
 def eligible_members():
-    return [m for m in team_members if counts[m] < ideal_targets[m]]
+    # Always sorted alphabetically for deterministic selection
+    return sorted([m for m in team_members if counts[m] < ideal_targets[m]])
 
 # --- Assignments tab mapping ---
 brand_to_member = {}
@@ -101,15 +91,15 @@ for _, row in assignments_df.iterrows():
     if brand and member:
         brand_to_member[brand] = member
 
-# --- Step 1: Assign based on Assignments tab ---
-for brand, assigned_member in brand_to_member.items():
+# --- Step 1: Assign by Assignments tab (deterministic) ---
+for brand in sorted(brand_to_member.keys()):
+    assigned_member = brand_to_member[brand]
     if assigned_member not in team_members:
-        continue  # absent or invalid
+        continue
     brand_mask = product_df['Brand'] == brand
-    brand_rows = product_df[brand_mask & product_df['Assigned'].isna()].index.tolist()
-    brand_size = len(brand_rows)
+    brand_rows = sorted(product_df[brand_mask & product_df['Assigned'].isna()].index.tolist())
     remaining_capacity = ideal_targets[assigned_member] - counts[assigned_member]
-
+    brand_size = len(brand_rows)
     if remaining_capacity >= brand_size:
         product_df.loc[brand_rows, 'Assigned'] = assigned_member
         counts[assigned_member] += brand_size
@@ -118,33 +108,27 @@ for brand, assigned_member in brand_to_member.items():
         product_df.loc[to_assign, 'Assigned'] = assigned_member
         counts[assigned_member] += len(to_assign)
         for idx in brand_rows[remaining_capacity:]:
-            eligible = eligible_members()
-            if not eligible:
+            elig = eligible_members()
+            if not elig:
                 product_df.at[idx, 'Assigned'] = "Backlog"
                 continue
-            chosen = min(eligible, key=lambda m: counts[m])
+            chosen = elig[0]
             product_df.at[idx, 'Assigned'] = chosen
             counts[chosen] += 1
 
-# --- Step 2: Remaining products by brand blocks + preferences ---
-brands_remaining = product_df.loc[product_df['Assigned'].isna(), 'Brand'].unique()
+# --- Step 2: Remaining products by brand blocks + preferences (deterministic) ---
+brands_remaining = sorted(product_df.loc[product_df['Assigned'].isna(), 'Brand'].unique())
 for brand in brands_remaining:
     brand_mask = product_df['Brand'] == brand
-    brand_rows = product_df[brand_mask & product_df['Assigned'].isna()].index.tolist()
+    brand_rows = sorted(product_df[brand_mask & product_df['Assigned'].isna()].index.tolist())
     brand_size = len(brand_rows)
-
-    eligible = eligible_members()
-    if not eligible:
+    elig = eligible_members()
+    if not elig:
         product_df.loc[brand_rows, 'Assigned'] = "Backlog"
         continue
-
-    brand_divisions = product_df.loc[brand_rows, 'Division'].unique()
-    pref_eligible = [m for m in eligible if any(div in active_preferences.get(m, []) for div in brand_divisions)]
-    if pref_eligible:
-        chosen = min(pref_eligible, key=lambda m: counts[m])
-    else:
-        chosen = min(eligible, key=lambda m: counts[m])
-
+    brand_divs = sorted(product_df.loc[brand_rows, 'Division'].unique())
+    pref_elig = [m for m in elig if any(div in active_preferences.get(m, []) for div in brand_divs)]
+    chosen = pref_elig[0] if pref_elig else elig[0]
     remaining_capacity = ideal_targets[chosen] - counts[chosen]
     if remaining_capacity >= brand_size:
         product_df.loc[brand_rows, 'Assigned'] = chosen
@@ -154,31 +138,29 @@ for brand in brands_remaining:
         product_df.loc[to_assign, 'Assigned'] = chosen
         counts[chosen] += len(to_assign)
         for idx in brand_rows[remaining_capacity:]:
-            eligible = eligible_members()
-            if not eligible:
+            elig = eligible_members()
+            if not elig:
                 product_df.at[idx, 'Assigned'] = "Backlog"
                 continue
-            chosen = min(eligible, key=lambda m: counts[m])
-            product_df.at[idx, 'Assigned'] = chosen
-            counts[chosen] += 1
+            product_df.at[idx, 'Assigned'] = elig[0]
+            counts[elig[0]] += 1
 
-# --- Step 3: Priority override ---
+# --- Step 3: Priority override deterministic ---
 priority_mask = product_df['Assigned'].isna() & product_df['PriorityOverride'].notna()
-for idx in product_df[priority_mask].index:
-    eligible = eligible_members()
-    if eligible:
-        chosen = min(eligible, key=lambda m: counts[m])
+for idx in sorted(product_df[priority_mask].index):
+    elig = eligible_members()
+    if elig:
+        chosen = elig[0]
         product_df.at[idx, 'Assigned'] = chosen
         counts[chosen] += 1
     else:
         product_df.at[idx, 'Assigned'] = "Backlog"
 
-# --- Step 4: Any remaining unassigned ---
-remaining_mask = product_df['Assigned'].isna()
-for idx in product_df[remaining_mask].index:
-    eligible = eligible_members()
-    if eligible:
-        chosen = min(eligible, key=lambda m: counts[m])
+# --- Step 4: Any remaining unassigned deterministic ---
+for idx in sorted(product_df[product_df['Assigned'].isna()].index):
+    elig = eligible_members()
+    if elig:
+        chosen = elig[0]
         product_df.at[idx, 'Assigned'] = chosen
         counts[chosen] += 1
     else:
@@ -187,19 +169,15 @@ for idx in product_df[remaining_mask].index:
 # --- Write back QA sheet ---
 qa_df['Assigned'] = qa_df.index.map(lambda idx: product_df.at[idx, 'Assigned'] if idx in product_df.index else "")
 
-# --- Update Completed sheet for pivot ---
+# --- Update Completed sheet ---
 uploaded_file.seek(0)
 wb = load_workbook(filename=BytesIO(uploaded_file.read()))
 if 'Completed' not in wb.sheetnames:
     wb.create_sheet('Completed')
 completed_sheet = wb['Completed']
-
-# Clear previous data
 for row in completed_sheet['A1:Z1000']:
     for cell in row:
         cell.value = None
-
-# Write updated QA assignments
 completed_sheet['A1'] = "Brand"
 completed_sheet['B1'] = "Division"
 completed_sheet['C1'] = "Assigned"
@@ -210,17 +188,17 @@ for r_idx, row in enumerate(product_df.itertuples(index=False), start=2):
     completed_sheet[f"C{r_idx}"] = row.Assigned
     completed_sheet[f"D{r_idx}"] = row.AQDate
 
-# --- Save all sheets to output ---
+# --- Save all sheets ---
 output_buffer = BytesIO()
 with pd.ExcelWriter(output_buffer, engine='openpyxl') as writer:
     qa_df.to_excel(writer, sheet_name="QA", index=False)
     mp_df.to_excel(writer, sheet_name="MP", index=False)
     assignments_df.to_excel(writer, sheet_name="Assignments", index=False)
-    wb.save(writer.path)  # ensures Completed sheet is included
+    wb.save(writer.path)
 output_buffer.seek(0)
 
 st.download_button(
-    label="📥 Download Assigned QA Excel",
+    label="📥 Download Deterministic Assigned QA Excel",
     data=output_buffer,
     file_name=f"QA_Assigned_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
