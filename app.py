@@ -74,47 +74,68 @@ def member_limit(member):
 
 # --- Filter only rows with Column M populated ---
 product_df = qa_df[qa_df.iloc[:, 12].notna()].copy()
+total_products = len(product_df)
 
-# --- 1️⃣ Assign by preferences ---
-for member in team_members:
-    prefs = active_preferences[member]
-    for div in prefs:
-        mask = product_df['Assigned'].isna() & (product_df['Division'] == div)
-        rows_to_assign = product_df[mask].index
-        remaining_capacity = member_limit(member) - counts[member]
-        assign_count = min(len(rows_to_assign), remaining_capacity)
-        if assign_count > 0:
-            product_df.loc[rows_to_assign[:assign_count], 'Assigned'] = member
-            counts[member] += assign_count
+# --- Compute perfectly fair targets per member ---
+base_target = total_products // num_members
+remainder = total_products % num_members
 
-# --- 2️⃣ Assign priority override products ---
+# Initialize ideal targets
+ideal_targets = {m: min(member_limit(m), base_target) for m in team_members}
+
+# Distribute remainder fairly
+sorted_members = sorted(team_members)
+for i in range(remainder):
+    member = sorted_members[i % len(team_members)]
+    ideal_targets[member] = min(member_limit(member), ideal_targets[member] + 1)
+
+def eligible_members():
+    return [m for m in team_members if counts[m] < ideal_targets[m]]
+
+# --- Assign products respecting preferences and brand blocks ---
+for div in product_df['Division'].unique():
+    div_mask = product_df['Division'] == div
+    div_rows = product_df[div_mask & product_df['Assigned'].isna()].index.tolist()
+    
+    while div_rows:
+        eligible = eligible_members()
+        if not eligible:
+            product_df.loc[div_rows, 'Assigned'] = "Backlog"
+            break
+        
+        # Prefer members who like this division
+        pref_eligible = [m for m in eligible if div in active_preferences.get(m, [])]
+        if pref_eligible:
+            chosen = min(pref_eligible, key=lambda m: counts[m])
+        else:
+            chosen = min(eligible, key=lambda m: counts[m])
+        
+        # Assign one product at a time
+        product_df.at[div_rows[0], 'Assigned'] = chosen
+        counts[chosen] += 1
+        div_rows = div_rows[1:]
+
+# --- Assign remaining priority override products ---
 priority_mask = product_df['Assigned'].isna() & product_df['PriorityOverride'].notna()
 for idx in product_df[priority_mask].index:
-    eligible = [m for m in team_members if counts[m] < member_limit(m)]
+    eligible = eligible_members()
     if eligible:
-        chosen = min(eligible, key=lambda x: counts[x])
+        chosen = min(eligible, key=lambda m: counts[m])
         product_df.at[idx, 'Assigned'] = chosen
         counts[chosen] += 1
     else:
         product_df.at[idx, 'Assigned'] = "Backlog"
 
-# --- 3️⃣ Assign remaining products by brand globally ---
+# --- Any remaining unassigned products ---
 remaining_mask = product_df['Assigned'].isna()
-brands = product_df.loc[remaining_mask, 'Brand'].unique()
-for brand in brands:
-    brand_mask = remaining_mask & (product_df['Brand'] == brand)
-    rows_idx = product_df[brand_mask].index.tolist()
-    while rows_idx:
-        eligible = [m for m in team_members if counts[m] < member_limit(m)]
-        if not eligible:
-            product_df.loc[rows_idx, 'Assigned'] = "Backlog"
-            break
-        chosen = max(eligible, key=lambda m: member_limit(m) - counts[m])
-        remaining_capacity = member_limit(chosen) - counts[chosen]
-        assign_count = min(len(rows_idx), remaining_capacity)
-        product_df.loc[rows_idx[:assign_count], 'Assigned'] = chosen
-        counts[chosen] += assign_count
-        rows_idx = rows_idx[assign_count:]
+for idx in product_df[remaining_mask].index:
+    eligible = eligible_members()
+    if eligible:
+        chosen = min(eligible, key=lambda m: counts[m])
+        product_df.at[idx, 'Assigned'] = chosen
+        counts[chosen] += 1
+    else:
+        product_df.at[idx, 'Assigned'] = "Backlog"
 
 # --- Write assignments back ---
 qa_df['Assigned'] = qa_df.index.map(lambda idx: product_df.at[idx, 'Assigned'] if idx in product_df.index else "")
