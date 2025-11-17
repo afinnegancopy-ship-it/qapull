@@ -1,155 +1,118 @@
 import streamlit as st
-import pandas as pd
-from io import BytesIO
+import openpyxl
+from openpyxl import load_workbook
 from datetime import datetime
+from collections import defaultdict
 
-st.set_page_config(page_title="QA Assignment", layout="wide")
-st.title("📊 QA Assignment")
+st.title("Product Assignment Tool")
 
-# --- Upload workbook ---
-uploaded_file = st.file_uploader("Upload QA Excel file", type=["xlsx"])
-if uploaded_file is None:
-    st.info("Please upload an Excel file to proceed.")
-    st.stop()
+# --- File upload ---
+uploaded_file = st.file_uploader("Upload your Excel file", type=["xlsx"])
+if uploaded_file is not None:
 
-# --- Load sheets directly with pandas ---
-qa_df = pd.read_excel(uploaded_file, sheet_name="QA")
-mp_df = pd.read_excel(uploaded_file, sheet_name="MP")
-
-# --- Streamlit inputs ---
-backlog_mode = st.radio("Are you expecting to be in backlog today?", ["No", "Yes"]) == "Yes"
-
-absent_input = st.text_input("Type names of absent members (comma-separated)").strip()
-absent_list = [name.strip().title() for name in absent_input.split(",") if name.strip()]
-if absent_list:
-    st.warning(f"🟡 Absent today: {', '.join(absent_list)}")
-else:
-    st.success("✅ Everyone is present.")
-
-custom_input = st.text_input("Specify custom product limits (Name:Limit, comma-separated)").strip()
-custom_limits = {}
-if custom_input:
-    for entry in custom_input.split(","):
-        if ":" in entry:
-            name, limit = entry.split(":")
-            name = name.strip().title()
-            try:
-                limit = int(limit.strip())
-                custom_limits[name] = limit
-            except ValueError:
-                st.warning(f"⚠️ Invalid limit for {name}, ignoring.")
-
-# --- Preferences ---
-preferences = {}
-for _, row in mp_df.iterrows():
-    name, divs = row[0], row[1]
-    if name and divs:
-        div_list = [d.strip().title() for d in str(divs).split(",") if d.strip()]
-        preferences[name] = div_list
-
-# Filter absentees
-active_preferences = {name: divs for name, divs in preferences.items() if name not in absent_list}
-team_members = list(active_preferences.keys())
-num_members = len(team_members)
-if num_members == 0:
-    st.error("❌ No active team members available for assignment!")
-    st.stop()
-
-# --- Prepare QA data ---
-qa_df['Assigned'] = None
-qa_df['PriorityOverride'] = qa_df.iloc[:, 32].combine_first(qa_df.iloc[:, 33])
-qa_df['AQDate'] = qa_df.iloc[:, 42]
-qa_df['Division'] = qa_df.iloc[:, 17].astype(str).str.strip().str.title()
-qa_df['Brand'] = qa_df.iloc[:, 14].astype(str).str.strip().str.title()
-qa_df['Workflow'] = qa_df.iloc[:, 8].astype(str).str.strip()
-
-if backlog_mode:
-    qa_df.sort_values('AQDate', inplace=True)
-
-DEFAULT_TARGET = 100
-counts = {m: 0 for m in team_members}
-
-def member_limit(member):
-    return custom_limits.get(member, DEFAULT_TARGET)
-
-# --- Filter only rows with Column M populated ---
-product_df = qa_df[qa_df.iloc[:, 12].notna()].copy()
-
-# --- 1️⃣ Assign by preferences ---
-for member in team_members:
-    prefs = active_preferences[member]
-    for div in prefs:
-        mask = product_df['Assigned'].isna() & (product_df['Division'] == div)
-        rows_to_assign = product_df[mask].index
-        remaining_capacity = member_limit(member) - counts[member]
-        assign_count = min(len(rows_to_assign), remaining_capacity)
-        if assign_count > 0:
-            product_df.loc[rows_to_assign[:assign_count], 'Assigned'] = member
-            counts[member] += assign_count
-
-# --- 2️⃣ Assign priority override products ---
-priority_mask = product_df['Assigned'].isna() & product_df['PriorityOverride'].notna()
-for idx in product_df[priority_mask].index:
-    eligible = [m for m in team_members if counts[m] < member_limit(m)]
-    if eligible:
-        chosen = min(eligible, key=lambda x: counts[x])
-        product_df.at[idx, 'Assigned'] = chosen
-        counts[chosen] += 1
+    # --- Load workbook ---
+    wb = load_workbook(uploaded_file)
+    
+    if "QA" not in wb.sheetnames or "Assignment" not in wb.sheetnames:
+        st.error("❌ The workbook must have 'QA' and 'Assignment' sheets.")
     else:
-        product_df.at[idx, 'Assigned'] = "Backlog"
+        qa_ws = wb["QA"]
+        assign_ws = wb["Assignment"]
 
-# --- 3️⃣ Assign remaining products by brand globally ---
-remaining_mask = product_df['Assigned'].isna()
-brands = product_df.loc[remaining_mask, 'Brand'].unique()
-for brand in brands:
-    brand_mask = remaining_mask & (product_df['Brand'] == brand)
-    rows_idx = product_df[brand_mask].index.tolist()
-    while rows_idx:
-        eligible = [m for m in team_members if counts[m] < member_limit(m)]
-        if not eligible:
-            product_df.loc[rows_idx, 'Assigned'] = "Backlog"
-            break
-        chosen = max(eligible, key=lambda m: member_limit(m) - counts[m])
-        remaining_capacity = member_limit(chosen) - counts[chosen]
-        assign_count = min(len(rows_idx), remaining_capacity)
-        product_df.loc[rows_idx[:assign_count], 'Assigned'] = chosen
-        counts[chosen] += assign_count
-        rows_idx = rows_idx[assign_count:]
+        # --- Build assignment mapping (Brand → Team Member) ---
+        brand_to_member = {}
+        for row in assign_ws.iter_rows(min_row=2, values_only=True):
+            brand, member = row[0], row[1]
+            if brand and member:
+                brand_to_member[brand.strip().title()] = member.strip().title()
 
-# --- Write assignments back ---
-qa_df['Assigned'] = qa_df.index.map(lambda idx: product_df.at[idx, 'Assigned'] if idx in product_df.index else "")
+        # --- Determine active team members ---
+        team_members = list(set(brand_to_member.values()))
+        num_members = len(team_members)
+        if num_members == 0:
+            st.error("❌ No active team members found in Assignment tab!")
+        else:
 
-# --- Download ---
-output_buffer = BytesIO()
-with pd.ExcelWriter(output_buffer, engine='openpyxl') as writer:
-    qa_df.to_excel(writer, sheet_name="QA", index=False)
-    mp_df.to_excel(writer, sheet_name="MP", index=False)
-output_buffer.seek(0)
+            # --- Count products per brand ---
+            brand_rows = defaultdict(list)
+            for row in qa_ws.iter_rows(min_row=2):
+                brand = row[14].value  # Column O
+                if brand:
+                    brand_rows[str(brand).strip().title()].append(row)
 
-st.download_button(
-    label="📥 Download Assigned QA Excel",
-    data=output_buffer,
-    file_name=f"QA_Assigned_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-)
+            # --- Custom product limits ---
+            st.subheader("Custom Product Limits (Optional)")
+            st.write("Format: Name:Limit, separated by commas. Example: Alice:10,Bob:15")
+            custom_input = st.text_input("Enter custom limits:")
 
-# --- Dashboard & Summary ---
-st.subheader("📊 Summary of Assignments")
-summary_data = []
-for member in team_members:
-    assigned_count = sum(product_df['Assigned'] == member)
-    limit = member_limit(member)
-    summary_data.append({
-        "Team Member": member,
-        "Assigned": assigned_count,
-        "Limit": limit,
-        "Remaining Capacity": limit - assigned_count
-    })
+            custom_limits = {}
+            if custom_input:
+                for entry in custom_input.split(","):
+                    if ":" in entry:
+                        name, limit = entry.split(":")
+                        name = name.strip().title()
+                        try:
+                            limit = int(limit.strip())
+                            custom_limits[name] = limit
+                        except ValueError:
+                            st.warning(f"⚠️ Invalid limit for {name}, ignoring.")
 
-summary_df = pd.DataFrame(summary_data)
-st.dataframe(summary_df)
+            # --- Calculate even split for those without custom limits ---
+            total_products = sum(len(rows) for rows in brand_rows.values())
+            assigned_counts = {member: 0 for member in team_members}
 
-backlog_count = (product_df['Assigned'] == "Backlog").sum()
-st.write(f"**Backlog:** {backlog_count} products")
+            even_split = total_products // num_members
+            remainder = total_products % num_members
+            for i, member in enumerate(team_members):
+                if member not in custom_limits:
+                    custom_limits[member] = even_split + (1 if i < remainder else 0)
 
-st.bar_chart(summary_df.set_index("Team Member")["Assigned"])
+            # --- Helper: remaining capacity ---
+            def remaining_capacity(member):
+                return custom_limits.get(member, 0) - assigned_counts.get(member, 0)
+
+            # --- Assign brands ---
+            backlog_count = 0
+            for brand, rows in brand_rows.items():
+                member = brand_to_member.get(brand)
+                if not member or remaining_capacity(member) <= 0:
+                    for r in rows:
+                        r[0].value = "Backlog"
+                    backlog_count += len(rows)
+                    continue
+
+                if len(rows) <= remaining_capacity(member):
+                    for r in rows:
+                        r[0].value = member
+                    assigned_counts[member] += len(rows)
+                else:
+                    for r in rows[:remaining_capacity(member)]:
+                        r[0].value = member
+                    for r in rows[remaining_capacity(member):]:
+                        r[0].value = "Backlog"
+                        backlog_count += 1
+                    assigned_counts[member] += remaining_capacity(member)
+
+            # --- Save timestamped file ---
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+            output_path = f"Assigned_{timestamp}.xlsx"
+            wb.save(output_path)
+
+            # --- Show summary ---
+            st.success("✅ Assignment complete!")
+            st.write(f"📄 Saved as: `{output_path}`")
+
+            st.subheader("📊 Summary of assignments")
+            for member, count in assigned_counts.items():
+                limit = custom_limits.get(member)
+                st.write(f"- {member}: {count} products (Limit: {limit})")
+            st.write(f"- Backlog: {backlog_count} products")
+
+            # --- Download button ---
+            with open(output_path, "rb") as f:
+                st.download_button(
+                    label="Download Assigned File",
+                    data=f,
+                    file_name=output_path,
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
