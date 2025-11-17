@@ -15,6 +15,7 @@ if uploaded_file is None:
 # --- Load sheets directly with pandas ---
 qa_df = pd.read_excel(uploaded_file, sheet_name="QA")
 mp_df = pd.read_excel(uploaded_file, sheet_name="MP")
+assignments_df = pd.read_excel(uploaded_file, sheet_name="Assignments")
 
 # --- Streamlit inputs ---
 backlog_mode = st.radio("Are you expecting to be in backlog today?", ["No", "Yes"]) == "Yes"
@@ -47,7 +48,7 @@ for _, row in mp_df.iterrows():
         div_list = [d.strip().title() for d in str(divs).split(",") if d.strip()]
         preferences[name] = div_list
 
-# Filter absentees
+# --- Filter absentees ---
 active_preferences = {name: divs for name, divs in preferences.items() if name not in absent_list}
 team_members = list(active_preferences.keys())
 num_members = len(team_members)
@@ -92,30 +93,87 @@ for i in range(remainder):
 def eligible_members():
     return [m for m in team_members if counts[m] < ideal_targets[m]]
 
-# --- Assign products respecting preferences and brand blocks ---
-for div in product_df['Division'].unique():
-    div_mask = product_df['Division'] == div
-    div_rows = product_df[div_mask & product_df['Assigned'].isna()].index.tolist()
-    
-    while div_rows:
-        eligible = eligible_members()
-        if not eligible:
-            product_df.loc[div_rows, 'Assigned'] = "Backlog"
-            break
-        
-        # Prefer members who like this division
-        pref_eligible = [m for m in eligible if div in active_preferences.get(m, [])]
-        if pref_eligible:
-            chosen = min(pref_eligible, key=lambda m: counts[m])
-        else:
-            chosen = min(eligible, key=lambda m: counts[m])
-        
-        # Assign one product at a time
-        product_df.at[div_rows[0], 'Assigned'] = chosen
-        counts[chosen] += 1
-        div_rows = div_rows[1:]
+# --- Read Assignments tab and map Brand -> Member ---
+brand_to_member = {}
+for _, row in assignments_df.iterrows():
+    brand = str(row[0]).strip().title()
+    member = str(row[1]).strip().title()
+    if brand and member:
+        brand_to_member[brand] = member
 
-# --- Assign remaining priority override products ---
+# --- Step 1: Assign based on Assignments tab ---
+for brand, assigned_member in brand_to_member.items():
+    if assigned_member not in team_members:
+        # Assigned member is absent or invalid
+        continue
+    
+    brand_mask = product_df['Brand'] == brand
+    brand_rows = product_df[brand_mask & product_df['Assigned'].isna()].index.tolist()
+    brand_size = len(brand_rows)
+    
+    remaining_capacity = ideal_targets[assigned_member] - counts[assigned_member]
+    
+    if remaining_capacity >= brand_size:
+        product_df.loc[brand_rows, 'Assigned'] = assigned_member
+        counts[assigned_member] += brand_size
+    else:
+        # Assign as much as possible to the assigned_member
+        to_assign = brand_rows[:remaining_capacity]
+        product_df.loc[to_assign, 'Assigned'] = assigned_member
+        counts[assigned_member] += len(to_assign)
+        
+        # Remaining products assigned to other eligible members
+        remaining_rows = brand_rows[remaining_capacity:]
+        for idx in remaining_rows:
+            eligible = eligible_members()
+            if not eligible:
+                product_df.at[idx, 'Assigned'] = "Backlog"
+                continue
+            chosen = min(eligible, key=lambda m: counts[m])
+            product_df.at[idx, 'Assigned'] = chosen
+            counts[chosen] += 1
+
+# --- Step 2: Assign remaining products using brand blocks + preferences ---
+brands_remaining = product_df.loc[product_df['Assigned'].isna(), 'Brand'].unique()
+for brand in brands_remaining:
+    brand_mask = product_df['Brand'] == brand
+    brand_rows = product_df[brand_mask & product_df['Assigned'].isna()].index.tolist()
+    brand_size = len(brand_rows)
+    
+    eligible = eligible_members()
+    if not eligible:
+        product_df.loc[brand_rows, 'Assigned'] = "Backlog"
+        continue
+    
+    # Prefer members who like any division in this brand
+    brand_divisions = product_df.loc[brand_rows, 'Division'].unique()
+    pref_eligible = [m for m in eligible if any(div in active_preferences.get(m, []) for div in brand_divisions)]
+    
+    if pref_eligible:
+        chosen = min(pref_eligible, key=lambda m: counts[m])
+    else:
+        chosen = min(eligible, key=lambda m: counts[m])
+    
+    remaining_capacity = ideal_targets[chosen] - counts[chosen]
+    if remaining_capacity >= brand_size:
+        product_df.loc[brand_rows, 'Assigned'] = chosen
+        counts[chosen] += brand_size
+    else:
+        to_assign = brand_rows[:remaining_capacity]
+        product_df.loc[to_assign, 'Assigned'] = chosen
+        counts[chosen] += len(to_assign)
+        
+        remaining_rows = brand_rows[remaining_capacity:]
+        for idx in remaining_rows:
+            eligible = eligible_members()
+            if not eligible:
+                product_df.at[idx, 'Assigned'] = "Backlog"
+                continue
+            chosen = min(eligible, key=lambda m: counts[m])
+            product_df.at[idx, 'Assigned'] = chosen
+            counts[chosen] += 1
+
+# --- Step 3: Assign remaining priority override products ---
 priority_mask = product_df['Assigned'].isna() & product_df['PriorityOverride'].notna()
 for idx in product_df[priority_mask].index:
     eligible = eligible_members()
@@ -126,7 +184,7 @@ for idx in product_df[priority_mask].index:
     else:
         product_df.at[idx, 'Assigned'] = "Backlog"
 
-# --- Any remaining unassigned products ---
+# --- Step 4: Any remaining unassigned products ---
 remaining_mask = product_df['Assigned'].isna()
 for idx in product_df[remaining_mask].index:
     eligible = eligible_members()
@@ -145,6 +203,7 @@ output_buffer = BytesIO()
 with pd.ExcelWriter(output_buffer, engine='openpyxl') as writer:
     qa_df.to_excel(writer, sheet_name="QA", index=False)
     mp_df.to_excel(writer, sheet_name="MP", index=False)
+    assignments_df.to_excel(writer, sheet_name="Assignments", index=False)
 output_buffer.seek(0)
 
 st.download_button(
