@@ -91,7 +91,6 @@ else:
     st.info("🚀 Backlog mode OFF — assigning in normal order.")
 
 # --- Compute global even target (Option B priority) ---
-# First: enforce no one can exceed 100
 MAX_PER_MEMBER = 100
 num_members = len(active_members)
 max_possible = num_members * MAX_PER_MEMBER
@@ -100,16 +99,10 @@ if len(qa_rows) > max_possible:
     st.error("❌ Not enough capacity. Total products exceed 100 per member limit.")
     st.stop()
 
-# Even split respecting MAX 100 & custom limits
 member_limits = {}
 remaining_products = len(qa_rows)
 
 # Apply custom limits first
-total_custom = sum(custom_limits.values())
-if total_custom > remaining_products:
-    total_custom = remaining_products
-
-# Assign custom limits
 total_custom_assigned = 0
 for m in active_members:
     if m in custom_limits:
@@ -128,7 +121,6 @@ if non_custom:
     for idx, m in enumerate(non_custom):
         member_limits[m] = min(MAX_PER_MEMBER, per + (1 if idx < rem else 0))
 
-# --- Assignment structures ---
 assignments = {m: [] for m in active_members}
 counts = {m: 0 for m in active_members}
 
@@ -137,23 +129,19 @@ for member, limit in member_limits.items():
     st.write(f"- {member}: {limit} products")
 
 # --- Step 1: Brand Cohesion with HARD brand preference priority ---
-# If a brand has a preferred member, that member gets FIRST priority as long as they have space.
 for brand, rows in brand_blocks.items():
     block_size = len(rows)
 
     preferred = brand_to_member.get(brand, None)
     if preferred in active_members:
-        # Preferred member gets FIRST chance
         if counts[preferred] + block_size <= member_limits[preferred]:
             for r in rows:
                 qa_ws[f"A{r}"].value = preferred
                 assignments[preferred].append(r)
             counts[preferred] += block_size
-            continue  # Done with this brand, skip fallback assignment
+            continue
 
-    # If preferred can’t take them, fallback to even-split logic
     candidate_members = [m for m in active_members]
-
     assigned = False
     for m in candidate_members:
         if counts[m] + block_size <= member_limits[m]:
@@ -164,7 +152,50 @@ for brand, rows in brand_blocks.items():
             assigned = True
             break
 
-    # If no one can take full block, assign rows individually in Step 2
     if not assigned:
         for r in rows:
-            qa_ws[f"A{r}"] .value = None  # fallback: row-by-row will handle assignment
+            qa_ws[f"A{r}"].value = None  # fallback: row-by-row will handle assignment
+
+# --- Step 2: Row-by-row fill for unassigned rows ---
+for brand, rows in brand_blocks.items():
+    for r in rows:
+        if qa_ws[f"A{r}"].value:
+            continue
+        eligible = [m for m in active_members if counts[m] < member_limits[m]]
+        if not eligible:
+            qa_ws[f"A{r}"].value = "Backlog"
+        else:
+            m = min(eligible, key=lambda x: counts[x])
+            qa_ws[f"A{r}"].value = m
+            assignments[m].append(r)
+            counts[m] += 1
+
+# --- Convert formulas to values ---
+for row in qa_ws.iter_rows():
+    for cell in row:
+        if cell.data_type == "f":
+            cell.value = cell.value
+
+# --- Save to BytesIO ---
+output = BytesIO()
+timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+wb.save(output)
+output.seek(0)
+
+st.success("✅ Assignment complete!")
+
+st.subheader("Assignment Summary")
+for member, rows in assignments.items():
+    limit = member_limits[member]
+    st.write(f"- {member}: {len(rows)} products (Target: {limit})")
+
+backlog_count = sum(1 for r in qa_rows if qa_ws[f"A{r[0]}"].value == "Backlog")
+st.write(f"- Backlog: {backlog_count} products")
+
+# --- Download button ---
+st.download_button(
+    label="📥 Download Assigned Excel",
+    data=output,
+    file_name=f"QA_Assigned_{timestamp}.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+)
