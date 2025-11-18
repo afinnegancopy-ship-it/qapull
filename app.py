@@ -128,43 +128,32 @@ st.subheader("Per-Member Targets (Even Split, Max 100)")
 for member, limit in member_limits.items():
     st.write(f"- {member}: {limit} products")
 
-# --- Step 1: Brand Cohesion with HARD brand preference priority ---
+# --- Step 1 & 2 combined: Assign with brand preference, block cohesion, even split ---
 for brand, rows in brand_blocks.items():
     block_size = len(rows)
-
+    
+    # Try preferred member first
     preferred = brand_to_member.get(brand, None)
+    assigned_rows = 0
+    
     if preferred in active_members:
-        if counts[preferred] + block_size <= member_limits[preferred]:
-            for r in rows:
+        remaining_capacity = min(member_limits[preferred] - counts[preferred], MAX_PER_MEMBER - counts[preferred])
+        if remaining_capacity > 0:
+            take = min(remaining_capacity, block_size)
+            for r in rows[:take]:
                 qa_ws[f"A{r}"].value = preferred
                 assignments[preferred].append(r)
-            counts[preferred] += block_size
-            continue
+                counts[preferred] += 1
+            assigned_rows += take
 
-    candidate_members = [m for m in active_members]
-    assigned = False
-    for m in candidate_members:
-        if counts[m] + block_size <= member_limits[m]:
-            for r in rows:
-                qa_ws[f"A{r}"].value = m
-                assignments[m].append(r)
-            counts[m] += block_size
-            assigned = True
-            break
-
-    if not assigned:
-        for r in rows:
-            qa_ws[f"A{r}"].value = None  # fallback: row-by-row will handle assignment
-
-# --- Step 2: Row-by-row fill for unassigned rows ---
-for brand, rows in brand_blocks.items():
-    for r in rows:
-        if qa_ws[f"A{r}"].value:
-            continue
-        eligible = [m for m in active_members if counts[m] < member_limits[m]]
+    # Assign remaining rows row-by-row to members with lowest counts
+    for r in rows[assigned_rows:]:
+        # Find eligible members (respect MAX_PER_MEMBER and member_limits)
+        eligible = [m for m in active_members if counts[m] < member_limits[m] and counts[m] < MAX_PER_MEMBER]
         if not eligible:
             qa_ws[f"A{r}"].value = "Backlog"
         else:
+            # Pick member with the lowest count to ensure even split
             m = min(eligible, key=lambda x: counts[x])
             qa_ws[f"A{r}"].value = m
             assignments[m].append(r)
