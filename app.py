@@ -136,7 +136,38 @@ st.subheader("Per-Member Targets (Even Split, Max 100)")
 for member, limit in member_limits.items():
     st.write(f"- {member}: {limit} products")
 
-# --- Step 1: Brand Cohesion (Option B: keep together only if it doesn't break even split) ---
+# --- Step 1: Brand Cohesion with HARD brand preference priority ---
+# If a brand has a preferred member, that member gets FIRST priority as long as they have space.
+for brand, rows in brand_blocks.items():
+    block_size = len(rows)
+
+    preferred = brand_to_member.get(brand, None)
+    if preferred in active_members:
+        # Preferred member gets FIRST chance
+        if counts[preferred] + block_size <= member_limits[preferred]:
+            for r in rows:
+                qa_ws[f"A{r}"].value = preferred
+                assignments[preferred].append(r)
+            counts[preferred] += block_size
+            continue  # Done with this brand, skip fallback assignment
+
+    # If preferred can’t take them, fallback to even-split logic
+    candidate_members = [m for m in active_members]
+
+    assigned = False
+    for m in candidate_members:
+        if counts[m] + block_size <= member_limits[m]:
+            for r in rows:
+                qa_ws[f"A{r}"].value = m
+                assignments[m].append(r)
+            counts[m] += block_size
+            assigned = True
+            break
+
+    # If no one can take full block, assign rows individually in Step 2
+    if not assigned:
+        for r in rows:
+            qa_ws[f"A{r}"].value = None (Option B: keep together only if it doesn't break even split) ---
 for brand, rows in brand_blocks.items():
     block_size = len(rows)
 
