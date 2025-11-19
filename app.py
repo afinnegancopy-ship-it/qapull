@@ -7,10 +7,10 @@ import os
 
 # --- Streamlit UI ---
 st.title("QA Assignment Tool 📊")
-st.write("Assign QA tasks to active team members based on brand assignments and backlog mode.")
+st.write("Autoassigns Products to QA Team")
 
 # --- File upload ---
-uploaded_file = st.file_uploader("Upload your Excel file", type=["xlsx"])
+uploaded_file = st.file_uploader("Upload QA Template", type=["xlsx"])
 if uploaded_file is not None:
     # Save to a temp file
     temp_file_path = f"temp_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
@@ -183,3 +183,4 @@ if uploaded_file is not None:
                 file_name=output_path,
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
+
