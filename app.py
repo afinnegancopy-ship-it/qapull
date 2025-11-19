@@ -30,7 +30,7 @@ if uploaded_file is not None:
     backlog_mode = st.checkbox("Backlog mode (sort by earliest AQ date)", value=False)
 
     # --- Active members input ---
-    st.write("Enter active members today (optional limits with colon, e.g., Barry:50, Annie, Tony:70)")
+    st.write("Enter active members today (e.g: Ross, Phoebe, Monica: 20) Press Enter once added")
     working_input = st.text_input("Active members")
     
     if working_input:
@@ -183,5 +183,6 @@ if uploaded_file is not None:
                 file_name=output_path,
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
+
 
 
