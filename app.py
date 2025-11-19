@@ -7,7 +7,7 @@ import os
 
 # --- Streamlit UI ---
 st.title("QA Assignment Tool 📊")
-st.write("Autoassigns Products to QA Team")
+st.write("Auto Assigns Products to QA Team")
 
 # --- File upload ---
 uploaded_file = st.file_uploader("Upload QA Template", type=["xlsx"])
@@ -183,4 +183,5 @@ if uploaded_file is not None:
                 file_name=output_path,
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
+
 
