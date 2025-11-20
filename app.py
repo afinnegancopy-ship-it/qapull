@@ -8,8 +8,8 @@ import os
 # ---------------------------
 # Streamlit UI
 # ---------------------------
-st.title("QA Assignment Tool 📊 (Smart reservation + A1 rebalancing)")
-st.write("Assigns products to QA team while respecting brand blocks. No splitting unless block > individual limit.")
+st.title("QA Assignment Tool 📊")
+st.write("Assigns products to QA team.")
 
 # ---------------------------
 # File upload
@@ -289,3 +289,4 @@ if uploaded_file is not None:
                 file_name=output_path,
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
+
