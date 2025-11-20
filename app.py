@@ -32,10 +32,12 @@ if uploaded_file is not None:
     # --- Active members input ---
     st.write("Enter active members today (e.g: Ross, Phoebe, Monica: 20)")
     working_input = st.text_input("Active members")
-    
+
     if working_input:
         active_members = []
         custom_limits = {}
+
+        # Parse input such as "Ross: 20, Monica"
         for part in working_input.split(","):
             part = part.strip()
             if not part:
@@ -56,7 +58,7 @@ if uploaded_file is not None:
         if not active_members:
             st.error("No active members entered!")
             st.stop()
-        
+
         st.write(f"✅ Active members: {', '.join(active_members)}")
         if custom_limits:
             st.write("Custom limits:")
@@ -73,28 +75,32 @@ if uploaded_file is not None:
         # --- Build QA data grouped by brand ---
         brand_blocks = defaultdict(list)
         qa_rows = []
+
         for i, row in enumerate(qa_ws.iter_rows(min_row=2, values_only=True), start=2):
             m_value = row[12]
             brand = row[14]
             workflow = str(row[8]).strip() if row[8] else ""
             col_aq = row[42]
+
             if m_value is not None and str(m_value).strip() != "":
                 qa_rows.append((i, brand, workflow, col_aq))
                 if brand:
                     brand_blocks[brand.strip().title()].append(i)
 
-        # --- Apply backlog sorting if needed ---
+        # --- Backlog sorting ---
         if backlog_mode:
             st.info("🕐 Backlog mode ON — sorting all rows by earliest AQ date.")
+
             def sort_key(row_idx):
                 date_val = qa_ws[f"AQ{row_idx}"].value
                 return date_val if isinstance(date_val, datetime) else datetime.max
+
             for brand in brand_blocks:
                 brand_blocks[brand].sort(key=sort_key)
         else:
             st.info("🚀 Backlog mode OFF — assigning in normal order.")
 
-        # --- Set member limits ---
+        # --- Setup limits ---
         member_limits = {member: custom_limits.get(member, 100) for member in active_members}
         assignments = {member: [] for member in active_members}
         counts = {member: 0 for member in active_members}
@@ -103,55 +109,102 @@ if uploaded_file is not None:
         for member, limit in member_limits.items():
             st.write(f"- {member}: {limit} products")
 
-        # --- Step 1: Pre-assign brands from Assignments sheet ---
+        # ============================================================
+        #   STEP 1: Pre-assigned brands (from Assignments sheet)
+        # ============================================================
         for brand, rows in brand_blocks.items():
-            if brand in brand_to_member:
-                member = brand_to_member[brand]
-                if member not in active_members:
-                    eligible = [m for m in active_members if counts[m] < member_limits[m]]
-                    if not eligible:
-                        for r in rows:
-                            qa_ws[f"A{r}"].value = "Backlog"
-                        continue
-                    member = max(eligible, key=lambda x: member_limits[x] - counts[x])
-                for r in rows:
-                    if counts[member] < member_limits[member]:
-                        qa_ws[f"A{r}"].value = member
-                        assignments[member].append(r)
-                        counts[member] += 1
-                    else:
-                        qa_ws[f"A{r}"].value = "Backlog"
+            if brand not in brand_to_member:
+                continue
 
-        # --- Step 2: Assign remaining brand blocks ---
+            designated = brand_to_member[brand]
+
+            # If designated member is not working today, skip to Step 2 logic
+            if designated not in active_members:
+                continue
+
+            unassigned = rows.copy()
+            block_size = len(unassigned)
+
+            # Assign respecting limits and overflow logic
+            while unassigned:
+                remaining_capacity = member_limits[designated] - counts[designated]
+
+                if remaining_capacity <= 0:
+                    break  # No more room for designated member
+
+                if block_size <= remaining_capacity:
+                    # Entire block fits
+                    for r in unassigned:
+                        qa_ws[f"A{r}"].value = designated
+                        assignments[designated].append(r)
+                        counts[designated] += 1
+                    unassigned = []
+                else:
+                    # Partial fit (overflow)
+                    take = remaining_capacity
+                    to_assign = unassigned[:take]
+
+                    for r in to_assign:
+                        qa_ws[f"A{r}"].value = designated
+                        assignments[designated].append(r)
+                        counts[designated] += 1
+
+                    unassigned = unassigned[take:]
+                    block_size -= take
+
+        # ============================================================
+        #   STEP 2: Assign remaining brands
+        # ============================================================
         for brand, rows in brand_blocks.items():
+
+            # Filter rows still unassigned
             unassigned = [r for r in rows if qa_ws[f"A{r}"].value in [None, ""]]
             if not unassigned:
                 continue
+
             block_size = len(unassigned)
-            eligible = [m for m in active_members if counts[m] + block_size <= member_limits[m]]
-            if eligible:
-                member = min(eligible, key=lambda x: counts[x])
-                for r in unassigned:
-                    qa_ws[f"A{r}"].value = member
-                    assignments[member].append(r)
-                    counts[member] += 1
-            else:
-                remaining_rows = list(unassigned)
-                eligible_members = sorted(active_members, key=lambda x: counts[x])
-                for member in eligible_members[:2]:
-                    capacity = member_limits[member] - counts[member]
-                    if capacity <= 0:
+
+            while unassigned:
+
+                # Sort members by load (ascending)
+                available = sorted(active_members, key=lambda m: counts[m])
+                assigned_this_round = False
+
+                for member in available:
+                    remaining_capacity = member_limits[member] - counts[member]
+
+                    if remaining_capacity <= 0:
                         continue
-                    to_assign = remaining_rows[:capacity]
+
+                    if block_size <= remaining_capacity:
+                        # Entire block fits in this member
+                        for r in unassigned:
+                            qa_ws[f"A{r}"].value = member
+                            assignments[member].append(r)
+                            counts[member] += 1
+                        unassigned = []
+                        assigned_this_round = True
+                        break
+
+                    # Block bigger than one member → overflow logic
+                    take = min(block_size, remaining_capacity)
+                    to_assign = unassigned[:take]
+
                     for r in to_assign:
                         qa_ws[f"A{r}"].value = member
                         assignments[member].append(r)
                         counts[member] += 1
-                    remaining_rows = remaining_rows[capacity:]
-                    if not remaining_rows:
-                        break
-                for r in remaining_rows:
-                    qa_ws[f"A{r}"].value = "Backlog"
+
+                    unassigned = unassigned[take:]
+                    block_size -= take
+                    assigned_this_round = True
+                    break
+
+                # No one can take anything → backlog
+                if not assigned_this_round:
+                    for r in unassigned:
+                        qa_ws[f"A{r}"].value = "Backlog"
+                    break
 
         # --- Convert formulas to values ---
         for row in qa_ws.iter_rows():
@@ -159,7 +212,7 @@ if uploaded_file is not None:
                 if cell.data_type == "f":
                     cell.value = cell.value
 
-        # --- Save timestamped file ---
+        # --- Save output file ---
         timestamp = datetime.now().strftime("%Y%m%d_%H%M")
         output_path = f"QA_Assignment_{timestamp}.xlsx"
         wb.save(output_path)
@@ -172,10 +225,11 @@ if uploaded_file is not None:
         for member, rows in assignments.items():
             limit = member_limits[member]
             st.write(f"- {member}: {len(rows)} products (Target: {limit})")
+
         backlog_count = sum(1 for r in qa_rows if qa_ws[f"A{r[0]}"].value == "Backlog")
         st.write(f"- Backlog: {backlog_count} products")
 
-        # --- Download link ---
+        # --- Download ---
         with open(output_path, "rb") as f:
             st.download_button(
                 label="📥 Download Assigned Excel",
@@ -183,7 +237,3 @@ if uploaded_file is not None:
                 file_name=output_path,
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
-
-
-
-
