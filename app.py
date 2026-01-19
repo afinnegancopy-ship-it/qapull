@@ -2,7 +2,7 @@ import streamlit as st
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 from datetime import datetime
-from collections import defaultdict, deque
+from collections import defaultdict
 import math
 
 # ---------------------------
@@ -10,7 +10,7 @@ import math
 # ---------------------------
 st.set_page_config(page_title="QA Assignment Tool", layout="wide")
 st.title("QA Assignment Tool 📊")
-st.write("Assigns products to QA team with smart distribution.")
+st.write("Even split with brand integrity. Priorities: 1) Perfect balance, 2) Pre-assignments, 3) Keep brands together")
 
 # ---------------------------
 # Helpers
@@ -40,196 +40,43 @@ def title_or_none(val):
     return val.strip().title() if isinstance(val, str) and val.strip() else None
 
 
-def remaining_capacity(member, limits, counts):
-    return max(0, limits.get(member, 0) - counts.get(member, 0))
-
-
-def distance_from_target(member, counts, targets):
-    """How far is this member from their target? Positive = room to add."""
-    return targets.get(member, 0) - counts.get(member, 0)
-
-
-def calculate_targets(active_members, member_limits, total_products):
-    """Calculate ideal target for each member based on their limits and total products."""
-    total_capacity = sum(member_limits[m] for m in active_members)
-    
-    if total_capacity == 0:
-        return {m: 0 for m in active_members}
+def calculate_exact_targets(active_members, total_products):
+    """
+    Calculate EXACT targets for perfect distribution.
+    E.g., 110 products / 5 members = 22 each
+    If remainder, distribute +1 to first N members
+    """
+    base = total_products // len(active_members)
+    remainder = total_products % len(active_members)
     
     targets = {}
-    for m in active_members:
-        proportion = member_limits[m] / total_capacity
-        ideal = round(total_products * proportion)
-        targets[m] = min(ideal, member_limits[m])
-    
-    # Adjust to hit total exactly
-    assigned = sum(targets.values())
-    diff = total_products - assigned
-    
-    members_by_slack = sorted(active_members, 
-                               key=lambda m: member_limits[m] - targets[m], 
-                               reverse=True)
-    i = 0
-    while diff > 0 and i < len(members_by_slack) * 2:
-        m = members_by_slack[i % len(members_by_slack)]
-        if targets[m] < member_limits[m]:
-            targets[m] += 1
-            diff -= 1
-        i += 1
-    
-    while diff < 0 and i < len(members_by_slack) * 2:
-        m = members_by_slack[i % len(members_by_slack)]
-        if targets[m] > 0:
-            targets[m] -= 1
-            diff += 1
-        i += 1
+    for i, m in enumerate(active_members):
+        targets[m] = base + (1 if i < remainder else 0)
     
     return targets
 
 
-def get_best_member_for_brand(brand_size, active_members, counts, targets, member_limits, max_overshoot_pct):
-    """
-    Find the best member to assign a whole brand to.
-    Prioritises members furthest from target who can take the brand without excessive overshoot.
-    """
+def get_member_furthest_from_target(active_members, counts, targets, required_space=1):
+    """Find member with most room to their target who has required_space available."""
     candidates = []
-    
     for m in active_members:
-        cap = remaining_capacity(m, member_limits, counts)
-        if cap <= 0:
-            continue
-            
-        dist = distance_from_target(m, counts, targets)
-        projected = counts[m] + brand_size
-        target = targets[m]
-        
-        # Calculate overshoot
-        if target > 0:
-            overshoot_pct = (projected - target) / target if projected > target else 0
-        else:
-            overshoot_pct = float('inf') if projected > 0 else 0
-        
-        can_fit = cap >= brand_size
-        within_tolerance = overshoot_pct <= max_overshoot_pct
-        
-        candidates.append({
-            'member': m,
-            'distance': dist,
-            'cap': cap,
-            'can_fit': can_fit,
-            'within_tolerance': within_tolerance,
-            'overshoot_pct': overshoot_pct
-        })
+        room = targets[m] - counts[m]
+        if room >= required_space:
+            candidates.append((m, room))
     
     if not candidates:
-        return None, False
+        return None
     
-    # Priority 1: Can fit whole brand within tolerance
-    fitting = [c for c in candidates if c['can_fit'] and c['within_tolerance']]
-    if fitting:
-        # Among those, pick the one furthest from target
-        fitting.sort(key=lambda c: -c['distance'])
-        return fitting[0]['member'], True
-    
-    # Priority 2: Can fit whole brand (even if over tolerance)
-    fitting = [c for c in candidates if c['can_fit']]
-    if fitting:
-        # Pick the one with least overshoot
-        fitting.sort(key=lambda c: c['overshoot_pct'])
-        return fitting[0]['member'], True
-    
-    # Priority 3: Nobody can fit whole brand - will need to split
-    # Return the one with most capacity
-    candidates.sort(key=lambda c: -c['cap'])
-    return candidates[0]['member'], False
+    # Sort by most room (furthest from target)
+    candidates.sort(key=lambda x: -x[1])
+    return candidates[0][0]
 
 
-def smart_rebalance_by_brands(qa_ws, assignments, counts, targets, brand_assignments, 
-                               active_members, assigned_col_letter, max_iterations=500):
-    """
-    Rebalance by moving whole small brands from over-target to under-target members.
-    This maintains brand integrity during rebalancing.
-    """
-    moves_made = 0
-    iterations = 0
-    
-    # Build brand -> rows mapping from current assignments
-    member_brands = defaultdict(list)  # member -> list of (brand, [rows])
-    for member in active_members:
-        brands_for_member = defaultdict(list)
-        for row in assignments[member]:
-            brand = brand_assignments.get(row, "Unknown")
-            brands_for_member[brand].append(row)
-        for brand, rows in brands_for_member.items():
-            member_brands[member].append((brand, rows))
-    
-    while iterations < max_iterations:
-        iterations += 1
-        
-        # Find most over and under target
-        over = [(m, counts[m] - targets[m]) for m in active_members if counts[m] > targets[m]]
-        under = [(m, targets[m] - counts[m]) for m in active_members if counts[m] < targets[m]]
-        
-        if not over or not under:
-            break
-        
-        over.sort(key=lambda x: -x[1])
-        under.sort(key=lambda x: -x[1])
-        
-        from_member = over[0][0]
-        to_member = under[0][0]
-        
-        # Current spread
-        current_spread = counts[from_member] - counts[to_member]
-        if current_spread <= 1:
-            break
-        
-        # Find a small brand to move that would improve balance
-        best_brand_to_move = None
-        best_improvement = 0
-        
-        for brand, rows in member_brands[from_member]:
-            brand_size = len(rows)
-            
-            # Would moving this brand improve the spread?
-            new_from_count = counts[from_member] - brand_size
-            new_to_count = counts[to_member] + brand_size
-            
-            # Check capacity
-            if new_to_count > member_limits[to_member]:
-                continue
-            
-            new_spread = abs(new_from_count - new_to_count)
-            improvement = current_spread - new_spread
-            
-            # Only move if it improves things and doesn't flip the imbalance too much
-            if improvement > 0 and new_to_count <= new_from_count + 2:
-                if improvement > best_improvement:
-                    best_improvement = improvement
-                    best_brand_to_move = (brand, rows)
-        
-        if best_brand_to_move:
-            brand, rows = best_brand_to_move
-            
-            # Move the brand
-            for r in rows:
-                qa_ws[f"{assigned_col_letter}{r}"].value = to_member
-                assignments[from_member].remove(r)
-                assignments[to_member].append(r)
-            
-            counts[from_member] -= len(rows)
-            counts[to_member] += len(rows)
-            
-            # Update brand tracking
-            member_brands[from_member].remove(best_brand_to_move)
-            member_brands[to_member].append(best_brand_to_move)
-            
-            moves_made += 1
-        else:
-            # No whole brand can be moved to improve balance
-            break
-    
-    return moves_made
+def get_members_with_room(active_members, counts, targets):
+    """Get list of members who are still below their target, sorted by most room."""
+    members = [(m, targets[m] - counts[m]) for m in active_members if counts[m] < targets[m]]
+    members.sort(key=lambda x: -x[1])
+    return [m for m, _ in members]
 
 
 # ---------------------------
@@ -293,25 +140,7 @@ st.subheader("⚙️ Configuration")
 backlog_mode = st.checkbox("Backlog mode (sort by earliest BT Image date)", value=False)
 
 with st.expander("🔧 Advanced Settings"):
-    col1, col2 = st.columns(2)
-    with col1:
-        MAX_OVERSHOOT_PCT = st.slider(
-            "Max Overshoot % (before splitting)", 
-            0.0, 0.5, 0.15, 0.05,
-            help="How much over target (%) before forcing a brand split. Lower = more even, but more splits."
-        )
-        FORCE_SPLIT_THRESHOLD = st.slider(
-            "Force Split Spread Threshold",
-            1, 20, 5, 1,
-            help="If spread exceeds this, force split remaining brands regardless of size."
-        )
-    with col2:
-        REBALANCE_BRANDS = st.checkbox(
-            "Rebalance by moving whole brands", 
-            value=True,
-            help="After assignment, try to move small brands to even out distribution."
-        )
-        SHOW_BRAND_DETAILS = st.checkbox("Show brand assignment details", value=False)
+    SHOW_BRAND_DETAILS = st.checkbox("Show brand assignment details", value=False)
 
 st.write("Enter active members today (e.g: Ross:100, Phoebe:80, Monica)")
 working_input = st.text_input("Active members")
@@ -333,7 +162,7 @@ for part in working_input.split(","):
         try:
             lim = int(limit.strip())
         except:
-            lim = 100
+            lim = 999
         active_members.append(name)
         member_limits[name] = lim
     else:
@@ -341,7 +170,7 @@ for part in working_input.split(","):
 
 for m in active_members:
     if m not in member_limits:
-        member_limits[m] = 100
+        member_limits[m] = 999  # High default
 
 # Preassignments from Assignments sheet
 brand_to_member = {}
@@ -361,7 +190,7 @@ if brand_to_member:
 # Build brand blocks
 brand_blocks = defaultdict(list)
 row_brand_order = []
-row_to_brand = {}  # Track which brand each row belongs to
+row_to_brand = {}
 
 for i, row in enumerate(qa_ws.iter_rows(min_row=2, values_only=True), start=2):
     pim_parent_id = row[COL_PIM_PARENT_ID - 1] if len(row) >= COL_PIM_PARENT_ID else None
@@ -387,226 +216,192 @@ if backlog_mode:
     for b in brand_blocks:
         brand_blocks[b].sort(key=row_date)
 
-# Build blocks list
+# Build blocks list with pre-assignment info
 blocks = []
 for b in row_brand_order:
-    blocks.append((b, brand_blocks[b].copy()))
+    pre_member = brand_to_member.get(b)
+    is_preassigned = pre_member is not None and pre_member in active_members
+    blocks.append({
+        'brand': b,
+        'rows': brand_blocks[b].copy(),
+        'size': len(brand_blocks[b]),
+        'preassigned_to': pre_member if is_preassigned else None
+    })
 
-# Calculate totals and targets
-total_products = sum(len(rows) for _, rows in blocks)
-targets = calculate_targets(active_members, member_limits, total_products)
+# Sort: pre-assigned first, then by size (smallest first - easier to fit)
+blocks.sort(key=lambda x: (0 if x['preassigned_to'] else 1, x['size']))
+
+# Calculate totals and EXACT targets
+total_products = sum(b['size'] for b in blocks)
+targets = calculate_exact_targets(active_members, total_products)
+
+# Check if limits are lower than targets
+for m in active_members:
+    if member_limits[m] < targets[m]:
+        st.warning(f"⚠️ {m}'s limit ({member_limits[m]}) is below their ideal target ({targets[m]})")
+        targets[m] = member_limits[m]
+
+# Recalculate if limits changed targets
+total_target = sum(targets.values())
+if total_target < total_products:
+    st.warning(f"⚠️ Total capacity ({total_target}) is less than products ({total_products}). Some will go to backlog.")
 
 # Display targets
-st.write("📊 **Calculated Targets:**")
+st.write("📊 **Exact Targets for Perfect Split:**")
 target_cols = st.columns(len(active_members))
 for i, m in enumerate(active_members):
     with target_cols[i]:
-        st.metric(m, f"Target: {targets[m]}", f"Max: {member_limits[m]}")
+        st.metric(m, f"{targets[m]} products")
 
 st.divider()
 
 # ---------------------------
-# SMART EVEN SPLIT ALGORITHM
+# PERFECT EVEN SPLIT ALGORITHM
 # ---------------------------
 # Strategy:
-# 1. Process pre-assigned brands first (to their assigned member)
-# 2. Sort remaining brands by size (largest first - harder to place)
-# 3. Assign whole brands to member furthest from target
-# 4. Only split if necessary to maintain balance
-# 5. Rebalance by moving whole small brands
+# 1. For each brand, try to assign to pre-assigned member (if any) up to their target
+# 2. If brand fits within ONE member's remaining room to target, assign whole
+# 3. Otherwise, split brand across members who have room
+# 4. Goal: Everyone hits their exact target
 
 counts = {m: 0 for m in active_members}
 assignments = {m: [] for m in active_members}
-brand_assignments_log = []  # Track for summary
+brand_assignments_log = []
 backlog_rows = []
 assigned_col_letter = get_column_letter(COL_ASSIGNED)
 
-# Separate pre-assigned and unassigned brands
-preassigned_blocks = []
-unassigned_blocks = []
-
-for brand, rows in blocks:
-    pre_member = brand_to_member.get(brand)
-    if pre_member and pre_member in active_members:
-        preassigned_blocks.append((brand, rows, pre_member))
-    else:
-        unassigned_blocks.append((brand, rows))
-
-# Sort unassigned by size (largest first)
-unassigned_blocks.sort(key=lambda x: -len(x[1]))
-
-# ---------------------------
-# PHASE 1: Process pre-assigned brands
-# ---------------------------
-for brand, rows, pre_member in preassigned_blocks:
-    block_size = len(rows)
-    cap = remaining_capacity(pre_member, member_limits, counts)
+for block in blocks:
+    brand = block['brand']
+    rows = block['rows'].copy()
+    preassigned_to = block['preassigned_to']
     
-    if cap >= block_size:
-        # Assign all to pre-assigned member
-        for r in rows:
-            qa_ws[f"{assigned_col_letter}{r}"].value = pre_member
-        assignments[pre_member].extend(rows)
-        counts[pre_member] += block_size
-        brand_assignments_log.append({
-            'brand': brand, 
-            'size': block_size, 
-            'member': pre_member, 
-            'split': False,
-            'preassigned': True
-        })
-    else:
-        # Partial assignment to pre-assigned member
-        if cap > 0:
-            for r in rows[:cap]:
-                qa_ws[f"{assigned_col_letter}{r}"].value = pre_member
-            assignments[pre_member].extend(rows[:cap])
-            counts[pre_member] += cap
+    if not rows:
+        continue
+    
+    # If pre-assigned, try to give to that member first
+    if preassigned_to:
+        room = targets[preassigned_to] - counts[preassigned_to]
+        if room > 0:
+            take = min(room, len(rows))
+            taken_rows = rows[:take]
+            rows = rows[take:]
+            
+            for r in taken_rows:
+                qa_ws[f"{assigned_col_letter}{r}"].value = preassigned_to
+            assignments[preassigned_to].extend(taken_rows)
+            counts[preassigned_to] += len(taken_rows)
+            
             brand_assignments_log.append({
-                'brand': brand, 
-                'size': cap, 
-                'member': pre_member, 
-                'split': True,
-                'preassigned': True
+                'brand': brand,
+                'size': len(taken_rows),
+                'member': preassigned_to,
+                'preassigned': True,
+                'split': len(rows) > 0  # Still more left = was split
             })
+    
+    # Distribute remaining rows
+    while rows:
+        # Find member with most room to their target
+        members_with_room = get_members_with_room(active_members, counts, targets)
         
-        # Remaining goes to others or backlog
-        remaining_rows = rows[cap:]
-        # Add to unassigned for processing
-        if remaining_rows:
-            unassigned_blocks.append((brand + " (overflow)", remaining_rows))
-
-# Re-sort unassigned after adding overflow
-unassigned_blocks.sort(key=lambda x: -len(x[1]))
-
-# ---------------------------
-# PHASE 2: Process unassigned brands (largest first)
-# ---------------------------
-for brand, rows in unassigned_blocks:
-    block_size = len(rows)
-    
-    if block_size == 0:
-        continue
-    
-    # Calculate current spread
-    current_counts = list(counts.values())
-    current_spread = max(current_counts) - min(current_counts) if current_counts else 0
-    
-    # Adjust overshoot tolerance based on current spread
-    # If spread is already high, be more aggressive about splitting
-    dynamic_overshoot = MAX_OVERSHOOT_PCT
-    if current_spread > FORCE_SPLIT_THRESHOLD:
-        dynamic_overshoot = 0.05  # Very strict - force more splits
-    
-    # Find best member for this brand
-    best_member, can_fit_whole = get_best_member_for_brand(
-        block_size, active_members, counts, targets, member_limits, dynamic_overshoot
-    )
-    
-    if best_member is None:
-        # No capacity anywhere
-        for r in rows:
-            qa_ws[f"{assigned_col_letter}{r}"].value = "Backlog"
-            backlog_rows.append(r)
-        continue
-    
-    if can_fit_whole:
-        # Assign whole brand to best member
-        for r in rows:
-            qa_ws[f"{assigned_col_letter}{r}"].value = best_member
-        assignments[best_member].extend(rows)
-        counts[best_member] += block_size
-        brand_assignments_log.append({
-            'brand': brand, 
-            'size': block_size, 
-            'member': best_member, 
-            'split': False,
-            'preassigned': False
-        })
-    else:
-        # Need to split - distribute proportionally by distance from target
-        eligible = [m for m in active_members if remaining_capacity(m, member_limits, counts) > 0]
-        
-        if not eligible:
+        if not members_with_room:
+            # Everyone at target - send to backlog
             for r in rows:
                 qa_ws[f"{assigned_col_letter}{r}"].value = "Backlog"
                 backlog_rows.append(r)
-            continue
+            break
         
-        # Calculate shares based on distance from target
-        distances = {m: max(0, distance_from_target(m, counts, targets)) for m in eligible}
-        total_distance = sum(distances.values())
+        # Check if ANY single member can take all remaining rows of this brand
+        brand_size = len(rows)
+        best_single_member = None
         
-        if total_distance == 0:
-            # Everyone at or over target - split by remaining capacity
-            caps = {m: remaining_capacity(m, member_limits, counts) for m in eligible}
-            total_cap = sum(caps.values())
-            if total_cap == 0:
-                for r in rows:
-                    qa_ws[f"{assigned_col_letter}{r}"].value = "Backlog"
-                    backlog_rows.append(r)
-                continue
-            distances = caps
-            total_distance = total_cap
+        for m in members_with_room:
+            room = targets[m] - counts[m]
+            if room >= brand_size:
+                best_single_member = m
+                break
         
-        # Calculate proportional shares
-        shares = {}
-        for m in eligible:
-            proportion = distances[m] / total_distance
-            shares[m] = min(
-                math.floor(block_size * proportion),
-                remaining_capacity(m, member_limits, counts)
-            )
-        
-        # Distribute remainder
-        assigned_so_far = sum(shares.values())
-        remainder = block_size - assigned_so_far
-        members_by_distance = sorted(eligible, key=lambda m: -distances[m])
-        
-        idx = 0
-        while remainder > 0 and idx < len(members_by_distance) * 3:
-            m = members_by_distance[idx % len(members_by_distance)]
-            if shares[m] < remaining_capacity(m, member_limits, counts):
-                shares[m] += 1
-                remainder -= 1
-            idx += 1
-        
-        # Assign rows
-        rows_copy = rows.copy()
-        for m in eligible:
-            if shares[m] > 0:
-                member_rows = rows_copy[:shares[m]]
-                rows_copy = rows_copy[shares[m]:]
+        if best_single_member:
+            # Assign whole remaining brand to one member
+            for r in rows:
+                qa_ws[f"{assigned_col_letter}{r}"].value = best_single_member
+            assignments[best_single_member].extend(rows)
+            counts[best_single_member] += len(rows)
+            
+            brand_assignments_log.append({
+                'brand': brand,
+                'size': len(rows),
+                'member': best_single_member,
+                'preassigned': False,
+                'split': preassigned_to is not None  # Split if part went to preassigned
+            })
+            rows = []
+        else:
+            # Must split - give each member exactly up to their target
+            for m in members_with_room:
+                if not rows:
+                    break
+                    
+                room = targets[m] - counts[m]
+                if room <= 0:
+                    continue
                 
-                for r in member_rows:
+                take = min(room, len(rows))
+                taken_rows = rows[:take]
+                rows = rows[take:]
+                
+                for r in taken_rows:
                     qa_ws[f"{assigned_col_letter}{r}"].value = m
-                assignments[m].extend(member_rows)
-                counts[m] += len(member_rows)
+                assignments[m].extend(taken_rows)
+                counts[m] += len(taken_rows)
                 
                 brand_assignments_log.append({
-                    'brand': brand, 
-                    'size': len(member_rows), 
-                    'member': m, 
-                    'split': True,
-                    'preassigned': False
+                    'brand': brand,
+                    'size': len(taken_rows),
+                    'member': m,
+                    'preassigned': False,
+                    'split': True
                 })
-        
-        # Any remaining to backlog
-        for r in rows_copy:
-            qa_ws[f"{assigned_col_letter}{r}"].value = "Backlog"
-            backlog_rows.append(r)
 
 # ---------------------------
-# PHASE 3: Rebalance by moving whole brands
+# FINAL BALANCE CHECK
 # ---------------------------
-rebalance_moves = 0
-if REBALANCE_BRANDS:
-    rebalance_moves = smart_rebalance_by_brands(
-        qa_ws, assignments, counts, targets, row_to_brand,
-        active_members, assigned_col_letter
-    )
-    if rebalance_moves > 0:
-        st.info(f"🔄 Rebalancing moved {rebalance_moves} whole brand(s) to improve distribution.")
+# Ensure perfect balance by moving individual products if needed
+
+final_adjustments = 0
+max_iterations = 1000
+iteration = 0
+
+while iteration < max_iterations:
+    iteration += 1
+    
+    # Find over and under target members
+    over = [(m, counts[m] - targets[m]) for m in active_members if counts[m] > targets[m]]
+    under = [(m, targets[m] - counts[m]) for m in active_members if counts[m] < targets[m]]
+    
+    if not over or not under:
+        break
+    
+    # Sort to get most imbalanced
+    over.sort(key=lambda x: -x[1])
+    under.sort(key=lambda x: -x[1])
+    
+    from_member = over[0][0]
+    to_member = under[0][0]
+    
+    if not assignments[from_member]:
+        break
+    
+    # Move one product
+    row_to_move = assignments[from_member].pop()
+    assignments[to_member].append(row_to_move)
+    counts[from_member] -= 1
+    counts[to_member] += 1
+    qa_ws[f"{assigned_col_letter}{row_to_move}"].value = to_member
+    final_adjustments += 1
+
+if final_adjustments > 0:
+    st.info(f"🔧 Final balancing moved {final_adjustments} product(s) to achieve perfect split.")
 
 # ---------------------------
 # Save and display results
@@ -636,16 +431,13 @@ summary_data = []
 for member in active_members:
     count = len(assignments.get(member, []))
     target = targets[member]
-    limit = member_limits[member]
     variance = count - target
-    variance_pct = (variance / target * 100) if target > 0 else 0
     summary_data.append({
         "Member": member,
         "Assigned": count,
         "Target": target,
-        "Limit": limit,
         "Variance": variance,
-        "Variance %": f"{variance_pct:+.1f}%"
+        "Status": "✅ Perfect" if variance == 0 else f"⚠️ {variance:+d}"
     })
 
 summary_df = pd.DataFrame(summary_data)
@@ -664,23 +456,25 @@ if assigned_counts:
     with metric_cols[1]:
         st.metric("Min Assigned", min_count)
     with metric_cols[2]:
-        st.metric("Spread", spread, delta=None, delta_color="inverse")
+        spread_delta = "Perfect!" if spread == 0 else f"{spread} off"
+        st.metric("Spread", spread, delta=spread_delta, delta_color="off" if spread == 0 else "inverse")
     with metric_cols[3]:
         st.metric("Backlog", len(backlog_rows))
 
-# Brand integrity stats
-brands_kept_whole = sum(1 for b in brand_assignments_log if not b['split'])
-brands_split = sum(1 for b in brand_assignments_log if b['split'])
-preassigned_count = sum(1 for b in brand_assignments_log if b['preassigned'])
+# Brand stats
+unique_brands = set(b['brand'] for b in brand_assignments_log)
+brands_split = len([b for b in unique_brands if sum(1 for x in brand_assignments_log if x['brand'] == b) > 1])
+brands_whole = len(unique_brands) - brands_split
+preassigned_honoured = len(set(b['brand'] for b in brand_assignments_log if b['preassigned']))
 
 st.write("**Brand Integrity:**")
 integrity_cols = st.columns(3)
 with integrity_cols[0]:
-    st.metric("Brands Kept Whole", brands_kept_whole)
+    st.metric("Brands Kept Whole", brands_whole)
 with integrity_cols[1]:
     st.metric("Brands Split", brands_split)
 with integrity_cols[2]:
-    st.metric("Pre-assigned Brands", preassigned_count)
+    st.metric("Pre-assignments Honoured", preassigned_honoured)
 
 # Chart
 st.subheader("📈 Distribution Chart")
@@ -695,7 +489,7 @@ try:
     
     fig = px.bar(chart_df, x="Member", y=["Assigned", "Target"], 
                  barmode="group", 
-                 title="Assigned vs Target",
+                 title="Assigned vs Target (Should be identical for perfect split)",
                  color_discrete_map={"Assigned": "#4CAF50", "Target": "#2196F3"})
     st.plotly_chart(fig, use_container_width=True)
 except ImportError:
