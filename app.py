@@ -139,9 +139,6 @@ st.subheader("⚙️ Configuration")
 
 backlog_mode = st.checkbox("Backlog mode (sort by earliest BT Image date)", value=False)
 
-with st.expander("🔧 Advanced Settings"):
-    SHOW_BRAND_DETAILS = st.checkbox("Show brand assignment details", value=False)
-
 st.write("Enter active members today (e.g: Ross:100, Phoebe:80, Monica)")
 working_input = st.text_input("Active members")
 
@@ -400,9 +397,6 @@ while iteration < max_iterations:
     qa_ws[f"{assigned_col_letter}{row_to_move}"].value = to_member
     final_adjustments += 1
 
-if final_adjustments > 0:
-    st.info(f"🔧 Final balancing moved {final_adjustments} product(s) to achieve perfect split.")
-
 # ---------------------------
 # Save and display results
 # ---------------------------
@@ -421,93 +415,6 @@ output_path = f"QA_Assignment_{timestamp}.xlsx"
 wb.save(output_path)
 
 st.success("✅ Assignment complete!")
-
-# Summary
-st.subheader("📊 Assignment Summary")
-
-import pandas as pd
-
-summary_data = []
-for member in active_members:
-    count = len(assignments.get(member, []))
-    target = targets[member]
-    variance = count - target
-    summary_data.append({
-        "Member": member,
-        "Assigned": count,
-        "Target": target,
-        "Variance": variance,
-        "Status": "✅ Perfect" if variance == 0 else f"⚠️ {variance:+d}"
-    })
-
-summary_df = pd.DataFrame(summary_data)
-st.dataframe(summary_df, use_container_width=True, hide_index=True)
-
-# Metrics
-assigned_counts = [len(assignments.get(m, [])) for m in active_members]
-if assigned_counts:
-    max_count = max(assigned_counts)
-    min_count = min(assigned_counts)
-    spread = max_count - min_count
-    
-    metric_cols = st.columns(4)
-    with metric_cols[0]:
-        st.metric("Max Assigned", max_count)
-    with metric_cols[1]:
-        st.metric("Min Assigned", min_count)
-    with metric_cols[2]:
-        spread_delta = "Perfect!" if spread == 0 else f"{spread} off"
-        st.metric("Spread", spread, delta=spread_delta, delta_color="off" if spread == 0 else "inverse")
-    with metric_cols[3]:
-        st.metric("Backlog", len(backlog_rows))
-
-# Brand stats
-unique_brands = set(b['brand'] for b in brand_assignments_log)
-brands_split = len([b for b in unique_brands if sum(1 for x in brand_assignments_log if x['brand'] == b) > 1])
-brands_whole = len(unique_brands) - brands_split
-preassigned_honoured = len(set(b['brand'] for b in brand_assignments_log if b['preassigned']))
-
-st.write("**Brand Integrity:**")
-integrity_cols = st.columns(3)
-with integrity_cols[0]:
-    st.metric("Brands Kept Whole", brands_whole)
-with integrity_cols[1]:
-    st.metric("Brands Split", brands_split)
-with integrity_cols[2]:
-    st.metric("Pre-assignments Honoured", preassigned_honoured)
-
-# Chart
-st.subheader("📈 Distribution Chart")
-try:
-    import plotly.express as px
-    
-    chart_df = pd.DataFrame({
-        "Member": active_members,
-        "Assigned": [len(assignments.get(m, [])) for m in active_members],
-        "Target": [targets[m] for m in active_members]
-    })
-    
-    fig = px.bar(chart_df, x="Member", y=["Assigned", "Target"], 
-                 barmode="group", 
-                 title="Assigned vs Target (Should be identical for perfect split)",
-                 color_discrete_map={"Assigned": "#4CAF50", "Target": "#2196F3"})
-    st.plotly_chart(fig, use_container_width=True)
-except ImportError:
-    st.write("Install plotly for charts: `pip install plotly`")
-
-# Brand details
-if SHOW_BRAND_DETAILS:
-    st.subheader("📋 Brand Assignment Details")
-    brand_df = pd.DataFrame(brand_assignments_log)
-    if not brand_df.empty:
-        brand_df = brand_df.rename(columns={
-            'brand': 'Brand',
-            'size': 'Products',
-            'member': 'Assigned To',
-            'split': 'Was Split',
-            'preassigned': 'Pre-assigned'
-        })
-        st.dataframe(brand_df, use_container_width=True, hide_index=True)
 
 # Download
 with open(output_path, "rb") as f:
