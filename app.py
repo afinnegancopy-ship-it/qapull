@@ -40,18 +40,62 @@ def title_or_none(val):
     return val.strip().title() if isinstance(val, str) and val.strip() else None
 
 
-def calculate_exact_targets(active_members, total_products):
+def calculate_exact_targets(active_members, total_products, member_limits):
     """
-    Calculate EXACT targets for perfect distribution.
-    E.g., 110 products / 5 members = 22 each
-    If remainder, distribute +1 to first N members
-    """
-    base = total_products // len(active_members)
-    remainder = total_products % len(active_members)
+    Calculate EXACT targets for perfect distribution, respecting member limits.
     
-    targets = {}
-    for i, m in enumerate(active_members):
-        targets[m] = base + (1 if i < remainder else 0)
+    When a member's limit is below their fair share, that capacity is redistributed
+    to other members who can take more. This iterates until stable.
+    
+    E.g., 321 products / 5 members = 64 each
+    If 4 members have limit 60, they can only take 240 total.
+    The 5th member (no limit) gets the remaining 81.
+    """
+    remaining = total_products
+    targets = {m: 0 for m in active_members}
+    locked = set()  # Members who have hit their limit
+    
+    # Iteratively distribute until stable
+    max_iterations = 100
+    iteration = 0
+    
+    while iteration < max_iterations:
+        iteration += 1
+        unlocked = [m for m in active_members if m not in locked]
+        
+        if not unlocked:
+            # Everyone is locked - remaining goes to backlog
+            break
+        
+        # Calculate fair share among unlocked members
+        per_person = remaining // len(unlocked)
+        remainder = remaining % len(unlocked)
+        
+        changed = False
+        temp_assignments = {}
+        
+        for i, m in enumerate(unlocked):
+            fair_share = per_person + (1 if i < remainder else 0)
+            limit = member_limits.get(m, 999)
+            
+            if limit < fair_share:
+                # This member can't take their fair share - lock them at their limit
+                temp_assignments[m] = limit
+                locked.add(m)
+                changed = True
+            else:
+                temp_assignments[m] = fair_share
+        
+        # Apply assignments
+        for m, count in temp_assignments.items():
+            targets[m] = count
+        
+        # Recalculate remaining for next iteration
+        remaining = total_products - sum(targets[m] for m in locked)
+        
+        if not changed:
+            # Stable - all unlocked members can take their fair share
+            break
     
     return targets
 
@@ -228,27 +272,25 @@ for b in row_brand_order:
 # Sort: pre-assigned first, then by size (smallest first - easier to fit)
 blocks.sort(key=lambda x: (0 if x['preassigned_to'] else 1, x['size']))
 
-# Calculate totals and EXACT targets
+# Calculate totals and EXACT targets (with redistribution!)
 total_products = sum(b['size'] for b in blocks)
-targets = calculate_exact_targets(active_members, total_products)
 
-# Check if limits are lower than targets
-for m in active_members:
-    if member_limits[m] < targets[m]:
-        st.warning(f"⚠️ {m}'s limit ({member_limits[m]}) is below their ideal target ({targets[m]})")
-        targets[m] = member_limits[m]
+# FIXED: Pass member_limits to calculate_exact_targets so it can redistribute
+targets = calculate_exact_targets(active_members, total_products, member_limits)
 
-# Recalculate if limits changed targets
-total_target = sum(targets.values())
-if total_target < total_products:
-    st.warning(f"⚠️ Total capacity ({total_target}) is less than products ({total_products}). Some will go to backlog.")
+# Check total capacity
+total_capacity = sum(targets.values())
+if total_capacity < total_products:
+    shortfall = total_products - total_capacity
+    st.warning(f"⚠️ Total capacity ({total_capacity}) is less than products ({total_products}). {shortfall} will go to backlog.")
 
 # Display targets
 st.write("📊 **Exact Targets for Perfect Split:**")
 target_cols = st.columns(len(active_members))
 for i, m in enumerate(active_members):
     with target_cols[i]:
-        st.metric(m, f"{targets[m]} products")
+        limit_info = f" (limit: {member_limits[m]})" if member_limits[m] < 999 else ""
+        st.metric(m, f"{targets[m]} products", delta=limit_info if limit_info else None)
 
 st.divider()
 
@@ -396,6 +438,28 @@ while iteration < max_iterations:
     counts[to_member] += 1
     qa_ws[f"{assigned_col_letter}{row_to_move}"].value = to_member
     final_adjustments += 1
+
+# ---------------------------
+# Results Summary
+# ---------------------------
+st.subheader("📈 Final Distribution")
+
+result_cols = st.columns(len(active_members))
+for i, m in enumerate(active_members):
+    with result_cols[i]:
+        diff = counts[m] - targets[m]
+        if diff == 0:
+            st.success(f"**{m}**: {counts[m]} ✓")
+        elif diff > 0:
+            st.warning(f"**{m}**: {counts[m]} (+{diff})")
+        else:
+            st.error(f"**{m}**: {counts[m]} ({diff})")
+
+if backlog_rows:
+    st.warning(f"📦 **Backlog**: {len(backlog_rows)} products")
+
+if final_adjustments > 0:
+    st.info(f"🔄 Made {final_adjustments} final adjustments for perfect balance")
 
 # ---------------------------
 # Save and display results
