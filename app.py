@@ -4,6 +4,9 @@ from openpyxl.utils import get_column_letter
 from datetime import datetime
 from collections import defaultdict
 import math
+import zipfile
+import os
+import re
 
 # ---------------------------
 # Streamlit UI
@@ -43,60 +46,49 @@ def title_or_none(val):
 def calculate_exact_targets(active_members, total_products, member_limits):
     """
     Calculate EXACT targets for perfect distribution, respecting member limits.
-    
+
     When a member's limit is below their fair share, that capacity is redistributed
     to other members who can take more. This iterates until stable.
-    
-    E.g., 321 products / 5 members = 64 each
-    If 4 members have limit 60, they can only take 240 total.
-    The 5th member (no limit) gets the remaining 81.
     """
     remaining = total_products
     targets = {m: 0 for m in active_members}
-    locked = set()  # Members who have hit their limit
-    
-    # Iteratively distribute until stable
+    locked = set()
+
     max_iterations = 100
     iteration = 0
-    
+
     while iteration < max_iterations:
         iteration += 1
         unlocked = [m for m in active_members if m not in locked]
-        
+
         if not unlocked:
-            # Everyone is locked - remaining goes to backlog
             break
-        
-        # Calculate fair share among unlocked members
+
         per_person = remaining // len(unlocked)
         remainder = remaining % len(unlocked)
-        
+
         changed = False
         temp_assignments = {}
-        
+
         for i, m in enumerate(unlocked):
             fair_share = per_person + (1 if i < remainder else 0)
             limit = member_limits.get(m, 999)
-            
+
             if limit < fair_share:
-                # This member can't take their fair share - lock them at their limit
                 temp_assignments[m] = limit
                 locked.add(m)
                 changed = True
             else:
                 temp_assignments[m] = fair_share
-        
-        # Apply assignments
+
         for m, count in temp_assignments.items():
             targets[m] = count
-        
-        # Recalculate remaining for next iteration
+
         remaining = total_products - sum(targets[m] for m in locked)
-        
+
         if not changed:
-            # Stable - all unlocked members can take their fair share
             break
-    
+
     return targets
 
 
@@ -107,11 +99,10 @@ def get_member_furthest_from_target(active_members, counts, targets, required_sp
         room = targets[m] - counts[m]
         if room >= required_space:
             candidates.append((m, room))
-    
+
     if not candidates:
         return None
-    
-    # Sort by most room (furthest from target)
+
     candidates.sort(key=lambda x: -x[1])
     return candidates[0][0]
 
@@ -121,6 +112,44 @@ def get_members_with_room(active_members, counts, targets):
     members = [(m, targets[m] - counts[m]) for m in active_members if counts[m] < targets[m]]
     members.sort(key=lambda x: -x[1])
     return [m for m, _ in members]
+
+
+def clean_output_xlsx(output_path):
+    """
+    Post-process the saved xlsx to remove external links and stale calcChain,
+    which cause Excel's repair/recovery prompt on open.
+    """
+    clean_path = output_path.replace(".xlsx", "_clean.xlsx")
+
+    skip_files = {
+        'xl/calcChain.xml',
+        'xl/externalLinks/externalLink1.xml',
+        'xl/externalLinks/externalLink2.xml',
+        'xl/externalLinks/_rels/externalLink1.xml.rels',
+        'xl/externalLinks/_rels/externalLink2.xml.rels',
+    }
+
+    with zipfile.ZipFile(output_path, 'r') as zin:
+        with zipfile.ZipFile(clean_path, 'w', zipfile.ZIP_DEFLATED) as zout:
+            for item in zin.infolist():
+                if item.filename in skip_files:
+                    continue
+                data = zin.read(item.filename)
+                # Scrub externalReferences block from workbook.xml
+                if item.filename == 'xl/workbook.xml':
+                    data = re.sub(rb'<externalReference[^/]*/>', b'', data)
+                    data = re.sub(
+                        rb'<externalReferences>.*?</externalReferences>',
+                        b'',
+                        data,
+                        flags=re.DOTALL
+                    )
+                # Scrub externalLink relationships from workbook.xml.rels
+                if item.filename == 'xl/_rels/workbook.xml.rels':
+                    data = re.sub(rb'<Relationship[^>]*externalLink[^>]*/>', b'', data)
+                zout.writestr(item, data)
+
+    os.replace(clean_path, output_path)
 
 
 # ---------------------------
@@ -135,7 +164,7 @@ temp_file_path = f"temp_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
 with open(temp_file_path, "wb") as f:
     f.write(uploaded_file.getbuffer())
 
-wb = load_workbook(temp_file_path)
+wb = load_workbook(temp_file_path, keep_links=False)
 if "QA" not in wb.sheetnames or "Assignments" not in wb.sheetnames:
     st.error("Excel file must contain 'QA' and 'Assignments' sheets.")
     st.stop()
@@ -211,7 +240,7 @@ for part in working_input.split(","):
 
 for m in active_members:
     if m not in member_limits:
-        member_limits[m] = 999  # High default
+        member_limits[m] = 999
 
 # Preassignments from Assignments sheet
 brand_to_member = {}
@@ -269,13 +298,11 @@ for b in row_brand_order:
         'preassigned_to': pre_member if is_preassigned else None
     })
 
-# Sort: pre-assigned first, then by size (smallest first - easier to fit)
+# Sort: pre-assigned first, then by size (smallest first)
 blocks.sort(key=lambda x: (0 if x['preassigned_to'] else 1, x['size']))
 
-# Calculate totals and EXACT targets (with redistribution!)
+# Calculate totals and EXACT targets
 total_products = sum(b['size'] for b in blocks)
-
-# FIXED: Pass member_limits to calculate_exact_targets so it can redistribute
 targets = calculate_exact_targets(active_members, total_products, member_limits)
 
 # Check total capacity
@@ -297,12 +324,6 @@ st.divider()
 # ---------------------------
 # PERFECT EVEN SPLIT ALGORITHM
 # ---------------------------
-# Strategy:
-# 1. For each brand, try to assign to pre-assigned member (if any) up to their target
-# 2. If brand fits within ONE member's remaining room to target, assign whole
-# 3. Otherwise, split brand across members who have room
-# 4. Goal: Everyone hits their exact target
-
 counts = {m: 0 for m in active_members}
 assignments = {m: [] for m in active_members}
 brand_assignments_log = []
@@ -313,10 +334,10 @@ for block in blocks:
     brand = block['brand']
     rows = block['rows'].copy()
     preassigned_to = block['preassigned_to']
-    
+
     if not rows:
         continue
-    
+
     # If pre-assigned, try to give to that member first
     if preassigned_to:
         room = targets[preassigned_to] - counts[preassigned_to]
@@ -324,76 +345,71 @@ for block in blocks:
             take = min(room, len(rows))
             taken_rows = rows[:take]
             rows = rows[take:]
-            
+
             for r in taken_rows:
                 qa_ws[f"{assigned_col_letter}{r}"].value = preassigned_to
             assignments[preassigned_to].extend(taken_rows)
             counts[preassigned_to] += len(taken_rows)
-            
+
             brand_assignments_log.append({
                 'brand': brand,
                 'size': len(taken_rows),
                 'member': preassigned_to,
                 'preassigned': True,
-                'split': len(rows) > 0  # Still more left = was split
+                'split': len(rows) > 0
             })
-    
+
     # Distribute remaining rows
     while rows:
-        # Find member with most room to their target
         members_with_room = get_members_with_room(active_members, counts, targets)
-        
+
         if not members_with_room:
-            # Everyone at target - send to backlog
             for r in rows:
                 qa_ws[f"{assigned_col_letter}{r}"].value = "Backlog"
                 backlog_rows.append(r)
             break
-        
-        # Check if ANY single member can take all remaining rows of this brand
+
         brand_size = len(rows)
         best_single_member = None
-        
+
         for m in members_with_room:
             room = targets[m] - counts[m]
             if room >= brand_size:
                 best_single_member = m
                 break
-        
+
         if best_single_member:
-            # Assign whole remaining brand to one member
             for r in rows:
                 qa_ws[f"{assigned_col_letter}{r}"].value = best_single_member
             assignments[best_single_member].extend(rows)
             counts[best_single_member] += len(rows)
-            
+
             brand_assignments_log.append({
                 'brand': brand,
                 'size': len(rows),
                 'member': best_single_member,
                 'preassigned': False,
-                'split': preassigned_to is not None  # Split if part went to preassigned
+                'split': preassigned_to is not None
             })
             rows = []
         else:
-            # Must split - give each member exactly up to their target
             for m in members_with_room:
                 if not rows:
                     break
-                    
+
                 room = targets[m] - counts[m]
                 if room <= 0:
                     continue
-                
+
                 take = min(room, len(rows))
                 taken_rows = rows[:take]
                 rows = rows[take:]
-                
+
                 for r in taken_rows:
                     qa_ws[f"{assigned_col_letter}{r}"].value = m
                 assignments[m].extend(taken_rows)
                 counts[m] += len(taken_rows)
-                
+
                 brand_assignments_log.append({
                     'brand': brand,
                     'size': len(taken_rows),
@@ -405,33 +421,28 @@ for block in blocks:
 # ---------------------------
 # FINAL BALANCE CHECK
 # ---------------------------
-# Ensure perfect balance by moving individual products if needed
-
 final_adjustments = 0
 max_iterations = 1000
 iteration = 0
 
 while iteration < max_iterations:
     iteration += 1
-    
-    # Find over and under target members
+
     over = [(m, counts[m] - targets[m]) for m in active_members if counts[m] > targets[m]]
     under = [(m, targets[m] - counts[m]) for m in active_members if counts[m] < targets[m]]
-    
+
     if not over or not under:
         break
-    
-    # Sort to get most imbalanced
+
     over.sort(key=lambda x: -x[1])
     under.sort(key=lambda x: -x[1])
-    
+
     from_member = over[0][0]
     to_member = under[0][0]
-    
+
     if not assignments[from_member]:
         break
-    
-    # Move one product
+
     row_to_move = assignments[from_member].pop()
     assignments[to_member].append(row_to_move)
     counts[from_member] -= 1
@@ -462,25 +473,17 @@ if final_adjustments > 0:
     st.info(f"🔄 Made {final_adjustments} final adjustments for perfect balance")
 
 # ---------------------------
-# Save and display results
+# Save, clean, and offer download
 # ---------------------------
-
-# Convert formulas to values
-for row in qa_ws.iter_rows():
-    for cell in row:
-        if cell.data_type == "f":
-            try:
-                cell.value = cell.value
-            except:
-                pass
-
 timestamp = datetime.now().strftime("%Y%m%d_%H%M")
 output_path = f"QA_Assignment_{timestamp}.xlsx"
 wb.save(output_path)
 
+# Remove external links and stale calcChain to prevent Excel repair prompt
+clean_output_xlsx(output_path)
+
 st.success("✅ Assignment complete!")
 
-# Download
 with open(output_path, "rb") as f:
     st.download_button(
         label="📥 Download Assigned Excel",
