@@ -135,7 +135,7 @@ def clean_output_xlsx(output_path):
                 if item.filename in skip_files:
                     continue
                 data = zin.read(item.filename)
-                # Scrub externalReferences block from workbook.xml
+                # Scrub externalReferences block and external defined names from workbook.xml
                 if item.filename == 'xl/workbook.xml':
                     data = re.sub(rb'<externalReference[^/]*/>', b'', data)
                     data = re.sub(
@@ -144,6 +144,10 @@ def clean_output_xlsx(output_path):
                         data,
                         flags=re.DOTALL
                     )
+                    # Remove any definedName that references an external workbook [n]
+                    data = re.sub(rb'<definedName[^>]*>\s*\'?\[[0-9]+\][^<]*</definedName>', b'', data)
+                    # Clean up empty definedNames block if all entries removed
+                    data = re.sub(rb'<definedNames>\s*</definedNames>', b'', data)
                 # Scrub externalLink relationships from workbook.xml.rels
                 if item.filename == 'xl/_rels/workbook.xml.rels':
                     data = re.sub(rb'<Relationship[^>]*externalLink[^>]*/>', b'', data)
